@@ -69,7 +69,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -106,12 +105,15 @@ public class TaskTest extends TestLogger {
 
     @ClassRule public static final TemporaryFolder TEMPORARY_FOLDER = new TemporaryFolder();
 
+    private static boolean wasCleanedUp = false;
+
     @Before
     public void setup() {
         awaitLatch = new OneShotLatch();
         triggerLatch = new OneShotLatch();
 
         shuffleEnvironment = new NettyShuffleEnvironmentBuilder().build();
+        wasCleanedUp = false;
     }
 
     @After
@@ -119,6 +121,54 @@ public class TaskTest extends TestLogger {
         if (shuffleEnvironment != null) {
             shuffleEnvironment.close();
         }
+    }
+
+    @Test
+    public void testCleanupWhenRestoreFails() throws Exception {
+        createTaskBuilder().setInvokable(InvokableWithExceptionInRestore.class).build().run();
+        assertTrue(wasCleanedUp);
+    }
+
+    @Test
+    public void testCleanupWhenInvokeFails() throws Exception {
+        createTaskBuilder().setInvokable(InvokableWithExceptionInInvoke.class).build().run();
+        assertTrue(wasCleanedUp);
+    }
+
+    @Test
+    public void testCleanupWhenCancelledAfterRestore() throws Exception {
+        Task task = createTaskBuilder().setInvokable(InvokableBlockingInRestore.class).build();
+        task.startTaskThread();
+        awaitLatch.await();
+        task.cancelExecution();
+        task.getExecutingThread().join();
+        assertTrue(wasCleanedUp);
+    }
+
+    @Test
+    public void testCleanupWhenAfterInvokeSucceeded() throws Exception {
+        createTaskBuilder().setInvokable(TestInvokableCorrect.class).build().run();
+        assertTrue(wasCleanedUp);
+    }
+
+    @Test
+    public void testCleanupWhenSwitchToInitializationFails() throws Exception {
+        createTaskBuilder()
+                .setInvokable(TestInvokableCorrect.class)
+                .setTaskManagerActions(
+                        new NoOpTaskManagerActions() {
+                            @Override
+                            public void updateTaskExecutionState(
+                                    TaskExecutionState taskExecutionState) {
+                                if (taskExecutionState.getExecutionState()
+                                        == ExecutionState.INITIALIZING) {
+                                    throw new ExpectedTestException();
+                                }
+                            }
+                        })
+                .build()
+                .run();
+        assertTrue(wasCleanedUp);
     }
 
     @Test
@@ -1217,9 +1267,14 @@ public class TaskTest extends TestLogger {
         public void invoke() {}
 
         @Override
-        public Future<Void> cancel() {
+        public void cancel() {
             fail("This should not be called");
-            return null;
+        }
+
+        @Override
+        public void cleanUp(Throwable throwable) throws Exception {
+            wasCleanedUp = true;
+            super.cleanUp(throwable);
         }
     }
 
@@ -1238,6 +1293,12 @@ public class TaskTest extends TestLogger {
         public void invoke() throws Exception {
             throw new Exception("test");
         }
+
+        @Override
+        public void cleanUp(Throwable throwable) throws Exception {
+            wasCleanedUp = true;
+            super.cleanUp(throwable);
+        }
     }
 
     static final class InvokableWithExceptionInRestore extends AbstractInvokable {
@@ -1252,6 +1313,12 @@ public class TaskTest extends TestLogger {
 
         @Override
         public void invoke() throws Exception {}
+
+        @Override
+        public void cleanUp(Throwable throwable) throws Exception {
+            wasCleanedUp = true;
+            super.cleanUp(throwable);
+        }
     }
 
     private static final class FailingInvokableWithChainedException extends AbstractInvokable {
@@ -1265,9 +1332,7 @@ public class TaskTest extends TestLogger {
         }
 
         @Override
-        public Future<Void> cancel() {
-            return CompletableFuture.completedFuture(null);
-        }
+        public void cancel() {}
     }
 
     private static class InvokableBlockingWithTrigger extends AbstractInvokable {
@@ -1349,6 +1414,12 @@ public class TaskTest extends TestLogger {
 
         @Override
         public void invoke() throws Exception {}
+
+        @Override
+        public void cleanUp(Throwable throwable) throws Exception {
+            wasCleanedUp = true;
+            super.cleanUp(throwable);
+        }
     }
 
     /** {@link AbstractInvokable} which throws {@link RuntimeException} on invoke. */
@@ -1359,20 +1430,24 @@ public class TaskTest extends TestLogger {
 
         @Override
         public void invoke() {
-            awaitLatch.trigger();
-
-            // make sure that the interrupt call does not
-            // grab us out of the lock early
-            while (true) {
-                try {
-                    triggerLatch.await();
-                    break;
-                } catch (InterruptedException e) {
-                    // fall through the loop
-                }
-            }
+            awaitTriggerLatch();
 
             throw new RuntimeException("test");
+        }
+    }
+
+    private static void awaitTriggerLatch() {
+        awaitLatch.trigger();
+
+        // make sure that the interrupt call does not
+        // grab us out of the lock early
+        while (true) {
+            try {
+                triggerLatch.await();
+                break;
+            } catch (InterruptedException e) {
+                // fall through the loop
+            }
         }
     }
 
@@ -1384,12 +1459,7 @@ public class TaskTest extends TestLogger {
 
         @Override
         public void invoke() {
-            awaitLatch.trigger();
-
-            try {
-                triggerLatch.await();
-            } catch (Throwable ignored) {
-            }
+            awaitTriggerLatch();
 
             throw new CancelTaskException();
         }
@@ -1418,12 +1488,11 @@ public class TaskTest extends TestLogger {
         }
 
         @Override
-        public Future<Void> cancel() throws Exception {
+        public void cancel() throws Exception {
             synchronized (this) {
                 triggerLatch.trigger();
                 wait();
             }
-            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -1445,12 +1514,11 @@ public class TaskTest extends TestLogger {
         }
 
         @Override
-        public Future<Void> cancel() {
+        public void cancel() {
             synchronized (lock) {
                 // do nothing but a placeholder
                 triggerLatch.trigger();
             }
-            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -1474,9 +1542,7 @@ public class TaskTest extends TestLogger {
         }
 
         @Override
-        public Future<Void> cancel() {
-            return CompletableFuture.completedFuture(null);
-        }
+        public void cancel() {}
     }
 
     // ------------------------------------------------------------------------

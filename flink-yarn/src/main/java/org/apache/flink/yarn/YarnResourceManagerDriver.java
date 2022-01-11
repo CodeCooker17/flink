@@ -41,6 +41,7 @@ import org.apache.flink.yarn.configuration.YarnResourceManagerDriverConfiguratio
 
 import org.apache.hadoop.yarn.api.protocolrecords.RegisterApplicationMasterResponse;
 import org.apache.hadoop.yarn.api.records.Container;
+import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
@@ -55,7 +56,6 @@ import org.apache.hadoop.yarn.client.api.async.NMClientAsync;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
@@ -116,6 +116,8 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
     private TaskExecutorProcessSpecContainerResourcePriorityAdapter
             taskExecutorProcessSpecContainerResourcePriorityAdapter;
 
+    private String taskManagerNodeLabel;
+
     public YarnResourceManagerDriver(
             Configuration flinkConfig,
             YarnResourceManagerDriverConfiguration configuration,
@@ -146,6 +148,9 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
         containerRequestHeartbeatIntervalMillis =
                 flinkConfig.getInteger(
                         YarnConfigOptions.CONTAINER_REQUEST_HEARTBEAT_INTERVAL_MILLISECONDS);
+
+        this.taskManagerNodeLabel =
+                flinkConfig.getString(YarnConfigOptions.TASK_MANAGER_NODE_LABEL);
 
         this.registerApplicationMasterResponseReflector =
                 new RegisterApplicationMasterResponseReflector(log);
@@ -258,7 +263,9 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
         } else {
             final Priority priority = priorityAndResourceOpt.get().getPriority();
             final Resource resource = priorityAndResourceOpt.get().getResource();
-            resourceManagerClient.addContainerRequest(getContainerRequest(resource, priority));
+            resourceManagerClient.addContainerRequest(
+                    ContainerRequestReflector.INSTANCE.getContainerRequest(
+                            resource, priority, taskManagerNodeLabel));
 
             // make sure we transmit the request fast and receive fast news of granted allocations
             resourceManagerClient.setHeartbeatInterval(containerRequestHeartbeatIntervalMillis);
@@ -546,13 +553,6 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
         }
     }
 
-    @Nonnull
-    @VisibleForTesting
-    static AMRMClient.ContainerRequest getContainerRequest(
-            Resource containerResource, Priority priority) {
-        return new AMRMClient.ContainerRequest(containerResource, null, null, priority);
-    }
-
     @VisibleForTesting
     private static ResourceID getContainerResourceId(Container container) {
         return new ResourceID(container.getId().toString(), container.getNodeId().toString());
@@ -589,7 +589,7 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
                             getResourceEventHandler()
                                     .onWorkerTerminated(
                                             new ResourceID(containerId),
-                                            containerStatus.getDiagnostics());
+                                            getContainerCompletedCause(containerStatus));
                         }
                     });
         }
@@ -688,5 +688,55 @@ public class YarnResourceManagerDriver extends AbstractResourceManagerDriver<Yar
                     containerId,
                     throwable);
         }
+    }
+
+    public static String getContainerCompletedCause(ContainerStatus containerStatus) {
+        final String completeContainerMessage;
+        switch (containerStatus.getExitStatus()) {
+            case ContainerExitStatus.SUCCESS:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s exited normally. Diagnostics: %s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getDiagnostics());
+                break;
+            case ContainerExitStatus.PREEMPTED:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s was preempted by yarn. Diagnostics: %s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getDiagnostics());
+                break;
+            case ContainerExitStatus.INVALID:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s was invalid. Diagnostics: %s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getDiagnostics());
+                break;
+            case ContainerExitStatus.ABORTED:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s killed by YARN, either due to being released by the application or being 'lost' due to node failures etc. Diagnostics: %s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getDiagnostics());
+                break;
+            case ContainerExitStatus.DISKS_FAILED:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s is failed because threshold number of the nodemanager-local-directories or"
+                                        + " threshold number of the nodemanager-log-directories have become bad. Diagnostics: %s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getDiagnostics());
+                break;
+            default:
+                completeContainerMessage =
+                        String.format(
+                                "Container %s marked as failed.\n Exit code:%s.\n Diagnostics:%s",
+                                containerStatus.getContainerId().toString(),
+                                containerStatus.getExitStatus(),
+                                containerStatus.getDiagnostics());
+        }
+        return completeContainerMessage;
     }
 }

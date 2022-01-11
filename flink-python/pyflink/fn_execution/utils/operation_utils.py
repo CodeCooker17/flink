@@ -16,7 +16,10 @@
 # limitations under the License.
 ################################################################################
 import datetime
-from collections import Iterable
+import threading
+import time
+from collections.abc import Generator
+
 from functools import partial
 
 from typing import Any, Tuple, Dict, List
@@ -33,31 +36,28 @@ _constant_num = 0
 
 
 def normalize_table_function_result(it):
+    def normalize_one_row(value):
+        if isinstance(value, tuple):
+            # We assume that tuple is a single line output
+            return [*value]
+        elif isinstance(value, Row):
+            # We assume that tuple is a single line output
+            return value._values
+        else:
+            # single field value
+            return [value]
+
     if it is None:
         return []
-    elif isinstance(it, tuple):
-        # We assume that tuple is a single line output
-        return [[*it]]
-    elif isinstance(it, Row):
-        # We assume that tuple is a single line output
-        return [it._values]
-    elif isinstance(it, Iterable):
+
+    if isinstance(it, (list, range, Generator)):
         def func():
             for item in it:
-                if not isinstance(item, Iterable):
-                    # single field value
-                    yield [item]
-                elif isinstance(item, tuple):
-                    yield [*item]
-                elif isinstance(item, Row):
-                    yield item._values
-                else:
-                    yield list(item)
+                yield normalize_one_row(item)
 
         return func()
     else:
-        # single field value
-        return [[it]]
+        return [normalize_one_row(it)]
 
 
 def normalize_pandas_result(it):
@@ -273,3 +273,36 @@ def load_aggregate_function(payload):
         return cls()
     else:
         return pickle.loads(payload)
+
+
+class PeriodicThread(threading.Thread):
+    """Call a function periodically with the specified number of seconds"""
+
+    def __init__(self,
+                 interval,
+                 function,
+                 args=None,
+                 kwargs=None
+                 ) -> None:
+        threading.Thread.__init__(self)
+        self._interval = interval
+        self._function = function
+        self._args = args if args is not None else []
+        self._kwargs = kwargs if kwargs is not None else {}
+        self._finished = threading.Event()
+
+    def run(self) -> None:
+        now = time.time()
+        next_call = now + self._interval
+        while (next_call <= now and not self._finished.is_set()) or \
+                (not self._finished.wait(next_call - now)):
+            if next_call <= now:
+                next_call = now + self._interval
+            else:
+                next_call = next_call + self._interval
+            self._function(*self._args, **self._kwargs)
+            now = time.time()
+
+    def cancel(self) -> None:
+        """Stop the thread if it hasn't finished yet."""
+        self._finished.set()

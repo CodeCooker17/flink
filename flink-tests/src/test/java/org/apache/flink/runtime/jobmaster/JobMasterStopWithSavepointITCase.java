@@ -36,9 +36,9 @@ import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobGraphBuilder;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
 import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
+import org.apache.flink.runtime.jobgraph.tasks.TaskInvokable;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.streaming.runtime.tasks.StreamTaskTest.NoOpStreamTask;
@@ -54,10 +54,8 @@ import org.junit.rules.TemporaryFolder;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.Collections;
-import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -65,13 +63,10 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.either;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasItem;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -98,31 +93,6 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
     private MiniClusterClient clusterClient;
 
     private JobGraph jobGraph;
-
-    @Test
-    public void suspendWithSavepointWithoutComplicationsShouldSucceedAndLeadJobToFinished()
-            throws Exception {
-        stopWithSavepointNormalExecutionHelper(false);
-    }
-
-    private void stopWithSavepointNormalExecutionHelper(final boolean terminate) throws Exception {
-        setUpJobGraph(NoOpBlockingStreamTask.class, RestartStrategies.noRestart());
-
-        final CompletableFuture<String> savepointLocationFuture = stopWithSavepoint(terminate);
-
-        assertThat(getJobStatus(), equalTo(JobStatus.RUNNING));
-
-        finishingLatch.trigger();
-
-        final String savepointLocation = savepointLocationFuture.get();
-        assertThat(getJobStatus(), equalTo(JobStatus.FINISHED));
-
-        final List<Path> savepoints;
-        try (Stream<Path> savepointFiles = Files.list(savepointDirectory)) {
-            savepoints = savepointFiles.map(Path::getFileName).collect(Collectors.toList());
-        }
-        assertThat(savepoints, hasItem(Paths.get(savepointLocation).getFileName()));
-    }
 
     @Test
     public void throwingExceptionOnCallbackWithNoRestartsShouldFailTheSuspend() throws Exception {
@@ -251,7 +221,7 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
     }
 
     private void setUpJobGraph(
-            final Class<? extends AbstractInvokable> invokable,
+            final Class<? extends TaskInvokable> invokable,
             final RestartStrategies.RestartStrategyConfiguration restartStrategy)
             throws Exception {
 
@@ -289,7 +259,6 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
                                 CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,
                                 true,
                                 false,
-                                false,
                                 0,
                                 0),
                         null);
@@ -315,7 +284,8 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
                                 .getMiniCluster()
                                 .getExecutionGraph(jobID)
                                 .get(60, TimeUnit.SECONDS),
-                deadline);
+                deadline,
+                false);
     }
 
     /**
@@ -368,11 +338,6 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
                 long checkpointId, long latestCompletedCheckpointId) {
             return CompletableFuture.completedFuture(null);
         }
-
-        @Override
-        protected void finishTask() {
-            mailboxProcessor.allActionsCompleted();
-        }
     }
 
     /** A {@link StreamTask} that simply waits to be terminated normally. */
@@ -392,14 +357,6 @@ public class JobMasterStopWithSavepointITCase extends AbstractTestBase {
             } else {
                 controller.suspendDefaultAction();
                 mailboxProcessor.suspend();
-            }
-        }
-
-        @Override
-        public void finishTask() throws Exception {
-            finishingLatch.await();
-            if (suspension != null) {
-                suspension.resume();
             }
         }
     }

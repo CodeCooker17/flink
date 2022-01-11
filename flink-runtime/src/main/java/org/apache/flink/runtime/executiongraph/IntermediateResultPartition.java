@@ -25,6 +25,8 @@ import org.apache.flink.runtime.scheduler.strategy.ConsumerVertexGroup;
 
 import java.util.List;
 
+import static org.apache.flink.util.Preconditions.checkNotNull;
+
 public class IntermediateResultPartition {
 
     private final IntermediateResult totalResult;
@@ -69,8 +71,8 @@ public class IntermediateResultPartition {
         return totalResult.getResultType();
     }
 
-    public List<ConsumerVertexGroup> getConsumerVertexGroups() {
-        return getEdgeManager().getConsumerVertexGroupsForPartition(partitionId);
+    public ConsumerVertexGroup getConsumerVertexGroup() {
+        return checkNotNull(getEdgeManager().getConsumerVertexGroupForPartition(partitionId));
     }
 
     public List<ConsumedPartitionGroup> getConsumedPartitionGroups() {
@@ -94,7 +96,9 @@ public class IntermediateResultPartition {
             }
         }
         hasDataProduced = false;
-        totalResult.notifyPartitionChanged();
+        for (ConsumedPartitionGroup consumedPartitionGroup : getConsumedPartitionGroups()) {
+            totalResult.clearCachedInformationForPartitionGroup(consumedPartitionGroup);
+        }
     }
 
     public void addConsumers(ConsumerVertexGroup consumers) {

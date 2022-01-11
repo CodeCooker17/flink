@@ -23,6 +23,7 @@ import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.core.fs.CloseableRegistry;
+import org.apache.flink.core.testutils.FlinkMatchers;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.queryablestate.KvStateID;
 import org.apache.flink.queryablestate.client.VoidNamespace;
@@ -59,6 +60,7 @@ import org.apache.flink.shaded.netty4.io.netty.channel.socket.SocketChannel;
 import org.apache.flink.shaded.netty4.io.netty.channel.socket.nio.NioServerSocketChannel;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 
+import org.hamcrest.core.CombinableMatcher;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -71,6 +73,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.channels.ClosedChannelException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -82,13 +85,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.hamcrest.CoreMatchers.either;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.fail;
 
 /** Tests for {@link Client}. */
@@ -136,20 +139,7 @@ public class ClientTest extends TestLogger {
             final AtomicReference<Channel> channel = new AtomicReference<>();
 
             serverChannel =
-                    createServerChannel(
-                            new ChannelInboundHandlerAdapter() {
-                                @Override
-                                public void channelActive(ChannelHandlerContext ctx)
-                                        throws Exception {
-                                    channel.set(ctx.channel());
-                                }
-
-                                @Override
-                                public void channelRead(ChannelHandlerContext ctx, Object msg)
-                                        throws Exception {
-                                    received.add((ByteBuf) msg);
-                                }
-                            });
+                    createServerChannel(new ChannelDataCollectingHandler(channel, received));
 
             InetSocketAddress serverAddress = getKvStateServerAddress(serverChannel);
 
@@ -265,10 +255,10 @@ public class ClientTest extends TestLogger {
 
         Client<KvStateInternalRequest, KvStateResponse> client = null;
 
-        try {
+        try (NetUtils.Port port = NetUtils.getAvailablePort()) {
             client = new Client<>("Test Client", 1, serializer, stats);
 
-            int availablePort = NetUtils.getAvailablePort();
+            int availablePort = port.getPort();
 
             InetSocketAddress serverAddress =
                     new InetSocketAddress(InetAddress.getLocalHost(), availablePort);
@@ -277,15 +267,10 @@ public class ClientTest extends TestLogger {
                     new KvStateInternalRequest(new KvStateID(), new byte[0]);
             CompletableFuture<KvStateResponse> future = client.sendRequest(serverAddress, request);
 
-            try {
-                future.get();
-                fail("Did not throw expected ConnectException");
-            } catch (ExecutionException e) {
-                if (!(e.getCause() instanceof ConnectException)) {
-                    fail("Did not throw expected ConnectException");
-                }
-                // else expected
-            }
+            assertThat(
+                    future,
+                    FlinkMatchers.futureWillCompleteExceptionally(
+                            ConnectException.class, Duration.ofHours(1)));
         } finally {
             if (client != null) {
                 try {
@@ -326,30 +311,7 @@ public class ClientTest extends TestLogger {
             client = new Client<>("Test Client", 1, serializer, stats);
 
             serverChannel =
-                    createServerChannel(
-                            new ChannelInboundHandlerAdapter() {
-                                @Override
-                                public void channelRead(ChannelHandlerContext ctx, Object msg)
-                                        throws Exception {
-                                    ByteBuf buf = (ByteBuf) msg;
-                                    assertEquals(
-                                            MessageType.REQUEST,
-                                            MessageSerializer.deserializeHeader(buf));
-                                    long requestId = MessageSerializer.getRequestId(buf);
-                                    KvStateInternalRequest request =
-                                            serializer.deserializeRequest(buf);
-
-                                    buf.release();
-
-                                    KvStateResponse response =
-                                            new KvStateResponse(serializedResult);
-                                    ByteBuf serResponse =
-                                            MessageSerializer.serializeResponse(
-                                                    ctx.alloc(), requestId, response);
-
-                                    ctx.channel().writeAndFlush(serResponse);
-                                }
-                            });
+                    createServerChannel(new RespondingChannelHandler(serializer, serializedResult));
 
             final InetSocketAddress serverAddress = getKvStateServerAddress(serverChannel);
 
@@ -437,20 +399,7 @@ public class ClientTest extends TestLogger {
             final AtomicReference<Channel> channel = new AtomicReference<>();
 
             serverChannel =
-                    createServerChannel(
-                            new ChannelInboundHandlerAdapter() {
-                                @Override
-                                public void channelActive(ChannelHandlerContext ctx)
-                                        throws Exception {
-                                    channel.set(ctx.channel());
-                                }
-
-                                @Override
-                                public void channelRead(ChannelHandlerContext ctx, Object msg)
-                                        throws Exception {
-                                    received.add((ByteBuf) msg);
-                                }
-                            });
+                    createServerChannel(new ChannelDataCollectingHandler(channel, received));
 
             InetSocketAddress serverAddress = getKvStateServerAddress(serverChannel);
 
@@ -550,24 +499,11 @@ public class ClientTest extends TestLogger {
         try {
             client = new Client<>("Test Client", 1, serializer, stats);
 
-            final AtomicBoolean received = new AtomicBoolean();
+            final LinkedBlockingQueue<ByteBuf> received = new LinkedBlockingQueue<>();
             final AtomicReference<Channel> channel = new AtomicReference<>();
 
             serverChannel =
-                    createServerChannel(
-                            new ChannelInboundHandlerAdapter() {
-                                @Override
-                                public void channelActive(ChannelHandlerContext ctx)
-                                        throws Exception {
-                                    channel.set(ctx.channel());
-                                }
-
-                                @Override
-                                public void channelRead(ChannelHandlerContext ctx, Object msg)
-                                        throws Exception {
-                                    received.set(true);
-                                }
-                            });
+                    createServerChannel(new ChannelDataCollectingHandler(channel, received));
 
             InetSocketAddress serverAddress = getKvStateServerAddress(serverChannel);
 
@@ -576,10 +512,7 @@ public class ClientTest extends TestLogger {
                     new KvStateInternalRequest(new KvStateID(), new byte[0]);
             Future<KvStateResponse> future = client.sendRequest(serverAddress, request);
 
-            while (!received.get()) {
-                Thread.sleep(50L);
-            }
-            assertTrue("Receive timed out", received.get());
+            received.take();
 
             assertEquals(1, stats.getNumConnections());
 
@@ -794,18 +727,16 @@ public class ClientTest extends TestLogger {
             }
             Assert.assertTrue(client.isEventGroupShutdown());
 
+            final CombinableMatcher<Throwable> exceptionMatcher =
+                    either(FlinkMatchers.containsCause(ClosedChannelException.class))
+                            .or(FlinkMatchers.containsCause(IllegalStateException.class));
+
             for (Future<Void> future : taskFutures) {
                 try {
                     future.get();
                     fail("Did not throw expected Exception after shut down");
                 } catch (ExecutionException t) {
-                    if (t.getCause().getCause() instanceof ClosedChannelException
-                            || t.getCause().getCause() instanceof IllegalStateException) {
-                        // Expected
-                    } else {
-                        t.printStackTrace();
-                        fail("Failed with unexpected Exception type: " + t.getClass().getName());
-                    }
+                    assertThat(t, exceptionMatcher);
                 }
             }
 
@@ -880,5 +811,55 @@ public class ClientTest extends TestLogger {
 
     private InetSocketAddress getKvStateServerAddress(Channel serverChannel) {
         return (InetSocketAddress) serverChannel.localAddress();
+    }
+
+    private static class ChannelDataCollectingHandler extends ChannelInboundHandlerAdapter {
+        private final AtomicReference<Channel> channel;
+        private final LinkedBlockingQueue<ByteBuf> received;
+
+        private ChannelDataCollectingHandler(
+                AtomicReference<Channel> channel, LinkedBlockingQueue<ByteBuf> received) {
+            this.channel = channel;
+            this.received = received;
+        }
+
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) {
+            channel.set(ctx.channel());
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            received.add((ByteBuf) msg);
+        }
+    }
+
+    @ChannelHandler.Sharable
+    private static final class RespondingChannelHandler extends ChannelInboundHandlerAdapter {
+        private final MessageSerializer<KvStateInternalRequest, KvStateResponse> serializer;
+        private final byte[] serializedResult;
+
+        private RespondingChannelHandler(
+                MessageSerializer<KvStateInternalRequest, KvStateResponse> serializer,
+                byte[] serializedResult) {
+            this.serializer = serializer;
+            this.serializedResult = serializedResult;
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            ByteBuf buf = (ByteBuf) msg;
+            assertEquals(MessageType.REQUEST, MessageSerializer.deserializeHeader(buf));
+            long requestId = MessageSerializer.getRequestId(buf);
+            KvStateInternalRequest request = serializer.deserializeRequest(buf);
+
+            buf.release();
+
+            KvStateResponse response = new KvStateResponse(serializedResult);
+            ByteBuf serResponse =
+                    MessageSerializer.serializeResponse(ctx.alloc(), requestId, response);
+
+            ctx.channel().writeAndFlush(serResponse);
+        }
     }
 }

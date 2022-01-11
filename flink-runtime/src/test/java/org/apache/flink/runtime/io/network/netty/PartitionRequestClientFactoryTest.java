@@ -21,7 +21,7 @@ package org.apache.flink.runtime.io.network.netty;
 import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.NetworkClientHandler;
 import org.apache.flink.runtime.io.network.netty.exception.RemoteTransportException;
-import org.apache.flink.util.NetUtils;
+import org.apache.flink.util.TestLogger;
 
 import org.apache.flink.shaded.netty4.io.netty.channel.ChannelException;
 import org.apache.flink.shaded.netty4.io.netty.channel.ChannelFuture;
@@ -44,9 +44,7 @@ import static org.junit.Assert.fail;
 import static org.mockito.Mockito.mock;
 
 /** {@link PartitionRequestClientFactory} test. */
-public class PartitionRequestClientFactoryTest {
-
-    private static final int SERVER_PORT = NetUtils.getAvailablePort();
+public class PartitionRequestClientFactoryTest extends TestLogger {
 
     @Test
     public void testInterruptsNotCached() throws Exception {
@@ -207,24 +205,6 @@ public class PartitionRequestClientFactoryTest {
         threadPoolExecutor.shutdown();
         serverAndClient.client().shutdown();
         serverAndClient.server().shutdown();
-    }
-
-    @Test(expected = RemoteTransportException.class)
-    public void testThrowsWhenNetworkFailure() throws Exception {
-        NettyTestUtil.NettyServerAndClient nettyServerAndClient = createNettyServerAndClient();
-        try {
-            NettyClient client = nettyServerAndClient.client();
-            PartitionRequestClientFactory factory = new PartitionRequestClientFactory(client, 0);
-
-            // Connect to a wrong address
-            InetSocketAddress addr =
-                    new InetSocketAddress(InetAddress.getLocalHost(), NetUtils.getAvailablePort());
-            ConnectionID connectionID = new ConnectionID(addr, 0);
-            factory.createPartitionRequestClient(connectionID);
-        } finally {
-            nettyServerAndClient.client().shutdown();
-            nettyServerAndClient.server().shutdown();
-        }
     }
 
     private NettyTestUtil.NettyServerAndClient createNettyServerAndClient() throws Exception {

@@ -23,6 +23,7 @@ import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.CheckpointType;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
 import org.apache.flink.runtime.execution.CancelTaskException;
@@ -39,7 +40,6 @@ import org.apache.flink.runtime.io.network.api.serialization.EventSerializer;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.Buffer.DataType;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
-import org.apache.flink.runtime.io.network.buffer.BufferListener.NotificationResult;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
 import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
@@ -118,9 +118,10 @@ import static org.mockito.Mockito.when;
 public class RemoteInputChannelTest {
 
     private static final long CHECKPOINT_ID = 1L;
-    private static final CheckpointOptions UNALIGNED = CheckpointOptions.unaligned(getDefault());
+    private static final CheckpointOptions UNALIGNED =
+            CheckpointOptions.unaligned(CheckpointType.CHECKPOINT, getDefault());
     private static final CheckpointOptions ALIGNED_WITH_TIMEOUT =
-            alignedWithTimeout(getDefault(), 10);
+            alignedWithTimeout(CheckpointType.CHECKPOINT, getDefault(), 10);
 
     @Test
     public void testGateNotifiedOnBarrierConversion() throws IOException, InterruptedException {
@@ -143,7 +144,12 @@ public class RemoteInputChannelTest {
             channel.onBuffer(
                     toBuffer(
                             new CheckpointBarrier(
-                                    1L, 123L, alignedWithTimeout(getDefault(), Integer.MAX_VALUE)),
+                                    1L,
+                                    123L,
+                                    alignedWithTimeout(
+                                            CheckpointType.CHECKPOINT,
+                                            getDefault(),
+                                            Integer.MAX_VALUE)),
                             false),
                     sequenceNumber,
                     0);
@@ -208,7 +214,9 @@ public class RemoteInputChannelTest {
 
         inputChannel.checkpointStarted(
                 new CheckpointBarrier(
-                        42, System.currentTimeMillis(), CheckpointOptions.unaligned(getDefault())));
+                        42,
+                        System.currentTimeMillis(),
+                        CheckpointOptions.unaligned(CheckpointType.CHECKPOINT, getDefault())));
 
         final Buffer buffer = createBuffer(TestBufferFactory.BUFFER_SIZE);
 
@@ -244,7 +252,7 @@ public class RemoteInputChannelTest {
                 8192,
                 (inputChannel, buffer, j) -> {
                     inputChannel.onBuffer(buffer, j, -1);
-                    return null;
+                    return true;
                 });
     }
 
@@ -270,7 +278,7 @@ public class RemoteInputChannelTest {
      */
     private void testConcurrentReleaseAndSomething(
             final int numberOfRepetitions,
-            TriFunction<RemoteInputChannel, Buffer, Integer, Object> function)
+            TriFunction<RemoteInputChannel, Buffer, Integer, Boolean> function)
             throws Exception {
 
         // Setup
@@ -290,10 +298,7 @@ public class RemoteInputChannelTest {
                                 for (int j = 0; j < 128; j++) {
                                     // this is the same buffer over and over again which will be
                                     // recycled by the RemoteInputChannel
-                                    Object obj =
-                                            function.apply(inputChannel, buffer.retainBuffer(), j);
-                                    if (obj instanceof NotificationResult
-                                            && obj == NotificationResult.BUFFER_NOT_USED) {
+                                    if (!function.apply(inputChannel, buffer.retainBuffer(), j)) {
                                         buffer.recycleBuffer();
                                     }
                                 }
@@ -584,8 +589,8 @@ public class RemoteInputChannelTest {
 
             // Assign the floating buffer to the listener and the channel is still waiting for more
             // floating buffers
-            verify(bufferPool, times(15)).requestBuffer();
-            verify(bufferPool, times(1)).addBufferListener(inputChannel.getBufferManager());
+            verify(bufferPool, times(16)).requestBuffer();
+            verify(bufferPool, times(2)).addBufferListener(inputChannel.getBufferManager());
             assertEquals(
                     "There should be 15 buffers available in the channel",
                     15,
@@ -604,8 +609,8 @@ public class RemoteInputChannelTest {
             inputChannel.onSenderBacklog(13);
 
             // Only the number of required buffers is changed by (backlog + numExclusiveBuffers)
-            verify(bufferPool, times(15)).requestBuffer();
-            verify(bufferPool, times(1)).addBufferListener(inputChannel.getBufferManager());
+            verify(bufferPool, times(16)).requestBuffer();
+            verify(bufferPool, times(2)).addBufferListener(inputChannel.getBufferManager());
             assertEquals(
                     "There should be 15 buffers available in the channel",
                     15,
@@ -625,8 +630,8 @@ public class RemoteInputChannelTest {
 
             // Return the floating buffer to the buffer pool and the channel is not waiting for more
             // floating buffers
-            verify(bufferPool, times(15)).requestBuffer();
-            verify(bufferPool, times(1)).addBufferListener(inputChannel.getBufferManager());
+            verify(bufferPool, times(16)).requestBuffer();
+            verify(bufferPool, times(2)).addBufferListener(inputChannel.getBufferManager());
             assertEquals(
                     "There should be 15 buffers available in the channel",
                     15,
@@ -646,8 +651,8 @@ public class RemoteInputChannelTest {
 
             // The floating buffer is requested from the buffer pool and the channel is registered
             // as listener again.
-            verify(bufferPool, times(17)).requestBuffer();
-            verify(bufferPool, times(2)).addBufferListener(inputChannel.getBufferManager());
+            verify(bufferPool, times(18)).requestBuffer();
+            verify(bufferPool, times(3)).addBufferListener(inputChannel.getBufferManager());
             assertEquals(
                     "There should be 16 buffers available in the channel",
                     16,
@@ -1412,6 +1417,15 @@ public class RemoteInputChannelTest {
         remoteChannel.resumeConsumption();
     }
 
+    @Test(expected = IllegalStateException.class)
+    public void testReleasedChannelAnnounceBufferSize() throws Exception {
+        SingleInputGate inputGate = createSingleInputGate(1);
+        RemoteInputChannel remoteChannel = createRemoteInputChannel(inputGate);
+
+        remoteChannel.releaseAllResources();
+        remoteChannel.announceBufferSize(10);
+    }
+
     @Test
     public void testOnUpstreamBlockedAndResumed() throws Exception {
         BufferPool bufferPool = new TestBufferPool();
@@ -1432,7 +1446,12 @@ public class RemoteInputChannelTest {
         Buffer barrier =
                 EventSerializer.toBuffer(
                         new CheckpointBarrier(
-                                1L, 123L, alignedWithTimeout(getDefault(), Integer.MAX_VALUE)),
+                                1L,
+                                123L,
+                                alignedWithTimeout(
+                                        CheckpointType.CHECKPOINT,
+                                        getDefault(),
+                                        Integer.MAX_VALUE)),
                         false);
         remoteChannel1.onBuffer(barrier, 0, 0);
         remoteChannel2.onBuffer(barrier, 0, 0);
@@ -1626,6 +1645,38 @@ public class RemoteInputChannelTest {
         sendBuffer(channel, sequenceNumber++, bufferSize++);
         assertGetNextBufferSequenceNumbers(channel, 2, 0);
         assertInflightBufferSizes(channel, 2);
+    }
+
+    @Test
+    public void testSizeOfQueuedBuffers() throws Exception {
+        int sequenceNumber = 0;
+        int bufferSize = 1;
+        int queueSize = 0;
+        final RemoteInputChannel channel = buildInputGateAndGetChannel(sequenceNumber);
+        assertEquals(0, channel.unsynchronizedGetSizeOfQueuedBuffers());
+
+        // Receive a couple of buffers.
+        for (int i = 0; i < 2; i++) {
+            queueSize += bufferSize;
+            sendBuffer(channel, sequenceNumber++, bufferSize++);
+            assertEquals(queueSize, channel.unsynchronizedGetSizeOfQueuedBuffers());
+        }
+
+        // Receive the event.
+        queueSize +=
+                EventSerializer.toSerializedEvent(new CheckpointBarrier(1L, 123L, UNALIGNED))
+                        .remaining();
+        sendBarrier(channel, sequenceNumber++, UNALIGNED);
+        assertEquals(queueSize, channel.unsynchronizedGetSizeOfQueuedBuffers());
+
+        // Poll all received buffers.
+        for (int i = 0; i < 3; i++) {
+            Optional<BufferAndAvailability> nextBuffer = channel.getNextBuffer();
+            queueSize -= nextBuffer.get().buffer().getSize();
+            assertEquals(queueSize, channel.unsynchronizedGetSizeOfQueuedBuffers());
+        }
+
+        assertEquals(0, channel.unsynchronizedGetSizeOfQueuedBuffers());
     }
 
     private void sendBarrier(

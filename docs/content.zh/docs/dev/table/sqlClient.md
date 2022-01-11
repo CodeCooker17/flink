@@ -201,8 +201,7 @@ Mode "embedded" (default) submits Flink jobs from the local machine.
          -pyarch,--pyArchives <arg>            Add python archive files for job. The
                                                archive files will be extracted to
                                                the working directory of python UDF
-                                               worker. Currently only zip-format is
-                                               supported. For each archive file, a
+                                               worker. For each archive file, a
                                                target directory be specified. If the
                                                target directory name is specified,
                                                the archive file will be extracted to
@@ -427,8 +426,8 @@ SET 'pipeline.name' = 'SqlJob';
 -- set the queue that the job submit to
 SET 'yarn.application.queue' = 'root';
 
--- set the job parallism
-SET 'parallism.default' = '100';
+-- set the job parallelism
+SET 'parallelism.default' = '100';
 
 -- restore from the specific savepoint path
 SET 'execution.savepoint.path' = '/tmp/flink-savepoints/savepoint-cca7bc-bb1e257f0dab';

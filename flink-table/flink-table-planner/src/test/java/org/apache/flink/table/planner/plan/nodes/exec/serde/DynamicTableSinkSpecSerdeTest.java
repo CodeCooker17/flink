@@ -20,14 +20,19 @@ package org.apache.flink.table.planner.plan.nodes.exec.serde;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableConfig;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.internal.TableEnvironmentImpl;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.Column;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.module.ModuleManager;
 import org.apache.flink.table.planner.calcite.FlinkContextImpl;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.functions.sql.FlinkSqlOperatorTable;
 import org.apache.flink.table.planner.plan.abilities.sink.OverwriteSpec;
 import org.apache.flink.table.planner.plan.abilities.sink.PartitioningSpec;
@@ -38,15 +43,14 @@ import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.utils.CatalogManagerMocks;
 
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectReader;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectWriter;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 import java.io.IOException;
-import java.io.StringWriter;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -71,25 +75,27 @@ public class DynamicTableSinkSpecSerdeTest {
                         new FlinkContextImpl(
                                 false,
                                 TableConfig.getDefault(),
+                                new ModuleManager(),
                                 null,
                                 CatalogManagerMocks.createEmptyCatalogManager(),
                                 null),
                         classLoader,
                         FlinkTypeFactory.INSTANCE(),
                         FlinkSqlOperatorTable.instance());
-        ObjectMapper mapper = JsonSerdeUtil.createObjectMapper(serdeCtx);
-        StringWriter writer = new StringWriter(100);
-        try (JsonGenerator gen = mapper.getFactory().createGenerator(writer)) {
-            gen.writeObject(spec);
-        }
-        String json = writer.toString();
-        DynamicTableSinkSpec actual = mapper.readValue(json, DynamicTableSinkSpec.class);
+        ObjectReader objectReader = JsonSerdeUtil.createObjectReader(serdeCtx);
+        ObjectWriter objectWriter = JsonSerdeUtil.createObjectWriter(serdeCtx);
+
+        String json = objectWriter.writeValueAsString(spec);
+        DynamicTableSinkSpec actual = objectReader.readValue(json, DynamicTableSinkSpec.class);
         assertEquals(spec, actual);
         assertNull(actual.getClassLoader());
         actual.setClassLoader(classLoader);
         assertNull(actual.getReadableConfig());
         actual.setReadableConfig(serdeCtx.getConfiguration());
-        assertNotNull(actual.getTableSink());
+        TableEnvironmentImpl tableEnv =
+                (TableEnvironmentImpl)
+                        TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+        assertNotNull(actual.getTableSink(((PlannerBase) tableEnv.getPlanner()).getFlinkContext()));
     }
 
     @Parameterized.Parameters(name = "{0}")

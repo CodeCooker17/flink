@@ -48,7 +48,7 @@ Elasticsearch 连接器允许将数据写入到 Elasticsearch 引擎的索引中
 ```sql
 CREATE TABLE myUserTable (
   user_id STRING,
-  user_name STRING
+  user_name STRING,
   uv BIGINT,
   pv BIGINT,
   PRIMARY KEY (user_id) NOT ENFORCED
@@ -204,6 +204,13 @@ CREATE TABLE myUserTable (
       <td>每次回退尝试之间的延迟。对于 <code>CONSTANT</code> 回退策略，该值是每次重试之间的延迟。对于 <code>EXPONENTIAL</code> 回退策略，该值是初始的延迟。</td>
     </tr>
     <tr>
+      <td><h5>sink.parallelism</h5></td>
+      <td>可选</td>
+      <td style="word-wrap: break-word;">（无）</td>
+      <td>Integer</td>
+      <td>定义 Elasticsearch sink 算子的并行度。默认情况下，并行度由框架定义为与上游串联的算子相同。</td>
+    </tr>
+    <tr>
       <td><h5>connection.max-retry-timeout</h5></td>
       <td>可选</td>
       <td style="word-wrap: break-word;">(none)</td>
@@ -216,6 +223,28 @@ CREATE TABLE myUserTable (
       <td style="word-wrap: break-word;">(none)</td>
       <td>String</td>
       <td>添加到每个 REST 通信中的前缀字符串，例如，<code>'/v1'</code>。</td>
+    </tr>
+    <tr>
+      <td><h5>connection.request-timeout</h5></td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>Duration</td>
+      <td>从连接管理器请求连接的超时时间。超时时间必须大于或者等于 0，如果设置为 0 则是无限超时。</td>
+    </tr>
+    <tr>
+      <td><h5>connection.timeout</h5></td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>Duration</td>
+      <td>建立请求的超时时间 。超时时间必须大于或者等于 0 ，如果设置为 0 则是无限超时。</td>
+    </tr>
+    <tr>
+      <td><h5>socket.timeout</h5></td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">(none)</td>
+      <td>Duration</td>
+      <td>等待数据的 socket 的超时时间 (SO_TIMEOUT)。超时时间必须大于或者等于 0，如果设置为 0 则是无限超时。
+      </td>
     </tr>
     <tr>
       <td><h5>format</h5></td>

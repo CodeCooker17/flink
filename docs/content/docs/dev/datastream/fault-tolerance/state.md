@@ -395,11 +395,17 @@ The update type configures when the state TTL is refreshed (by default `OnCreate
 
  - `StateTtlConfig.UpdateType.OnCreateAndWrite` - only on creation and write access
  - `StateTtlConfig.UpdateType.OnReadAndWrite` - also on read access
+
+    (**Notes:** If you set the state visibility to `StateTtlConfig.StateVisibility.ReturnExpiredIfNotCleanedUp`
+    at the same time, the state read cache will be disabled, which will cause some performance loss in PyFlink)
  
 The state visibility configures whether the expired value is returned on read access 
 if it is not cleaned up yet (by default `NeverReturnExpired`):
 
- - `StateTtlConfig.StateVisibility.NeverReturnExpired` - expired value is never returned
+ - `StateTtlConfig.StateVisibility.NeverReturnExpired` - expired value is never returned 
+
+    (**Notes:** The state read/write cache will be disabled, which will cause some performance loss in PyFlink)
+
  - `StateTtlConfig.StateVisibility.ReturnExpiredIfNotCleanedUp` - returned if still available
  
 In case of `NeverReturnExpired`, the expired state behaves as if it does not exist anymore, 
@@ -425,8 +431,6 @@ will lead to compatibility failure and `StateMigrationException`.
 
 - The map state with TTL currently supports null user values only if the user value serializer can handle null values. 
 If the serializer does not support null values, it can be wrapped with `NullableSerializer` at the cost of an extra byte in the serialized form.
-
-- State TTL is still not supported in PyFlink DataStream API.
 
 #### Cleanup of Expired State
 
@@ -765,7 +769,7 @@ public class BufferingSink
     @Override
     public void invoke(Tuple2<String, Integer> value, Context contex) throws Exception {
         bufferedElements.add(value);
-        if (bufferedElements.size() == threshold) {
+        if (bufferedElements.size() >= threshold) {
             for (Tuple2<String, Integer> element: bufferedElements) {
                 // send it to the sink
             }
@@ -812,7 +816,7 @@ class BufferingSink(threshold: Int = 0)
 
   override def invoke(value: (String, Int), context: Context): Unit = {
     bufferedElements += value
-    if (bufferedElements.size == threshold) {
+    if (bufferedElements.size >= threshold) {
       for (element <- bufferedElements) {
         // send it to the sink
       }

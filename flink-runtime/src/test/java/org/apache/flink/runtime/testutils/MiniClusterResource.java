@@ -19,7 +19,6 @@
 package org.apache.flink.runtime.testutils;
 
 import org.apache.flink.api.common.time.Deadline;
-import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -46,8 +45,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.runtime.testutils.PseudoRandomValueSelector.randomize;
+
 /** Resource which starts a {@link MiniCluster} for testing purposes. */
 public class MiniClusterResource extends ExternalResource {
+    private static final boolean RANDOMIZE_BUFFER_DEBLOAT_CONFIG =
+            Boolean.parseBoolean(System.getProperty("buffer-debloat.randomization", "false"));
 
     private static final MemorySize DEFAULT_MANAGED_MEMORY_SIZE = MemorySize.parse("80m");
 
@@ -172,11 +175,6 @@ public class MiniClusterResource extends ExternalResource {
                 new Configuration(miniClusterResourceConfiguration.getConfiguration());
         configuration.setString(
                 CoreOptions.TMP_DIRS, temporaryFolder.newFolder().getAbsolutePath());
-        configuration.setString(
-                ConfigConstants.METRICS_REPORTER_PREFIX
-                        + "mini_cluster_resource_reporter."
-                        + ConfigConstants.METRICS_REPORTER_FACTORY_CLASS_SUFFIX,
-                InMemoryReporter.Factory.class.getName());
 
         // we need to set this since a lot of test expect this because TestBaseUtils.startCluster()
         // enabled this by default
@@ -191,6 +189,8 @@ public class MiniClusterResource extends ExternalResource {
         // set rest and rpc port to 0 to avoid clashes with concurrent MiniClusters
         configuration.setInteger(JobManagerOptions.PORT, 0);
         configuration.setString(RestOptions.BIND_PORT, "0");
+
+        randomizeConfiguration(configuration);
 
         final MiniClusterConfiguration miniClusterConfiguration =
                 new MiniClusterConfiguration.Builder()
@@ -210,6 +210,19 @@ public class MiniClusterResource extends ExternalResource {
 
         final URI restAddress = miniCluster.getRestAddress().get();
         createClientConfiguration(restAddress);
+    }
+
+    /**
+     * This is the place for randomization the configuration that relates to task execution such as
+     * TaskManagerConf. Configurations which relates to streaming should be randomized in
+     * TestStreamEnvironment#randomizeConfiguration.
+     */
+    private static void randomizeConfiguration(Configuration configuration) {
+        // randomize ITTests for enabling buffer de-bloating
+        if (RANDOMIZE_BUFFER_DEBLOAT_CONFIG
+                && !configuration.contains(TaskManagerOptions.BUFFER_DEBLOAT_ENABLED)) {
+            randomize(configuration, TaskManagerOptions.BUFFER_DEBLOAT_ENABLED, true, false);
+        }
     }
 
     private void createClientConfiguration(URI restAddress) {

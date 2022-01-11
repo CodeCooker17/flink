@@ -50,6 +50,7 @@ import java.util.Optional;
  * @param <OUT> Type of the output.
  * @param <OP> Type of the operator this task runs.
  */
+@Deprecated
 class BoundedStreamTask<IN, OUT, OP extends OneInputStreamOperator<IN, OUT> & BoundedOneInput>
         extends StreamTask<OUT, OP> {
 
@@ -116,7 +117,7 @@ class BoundedStreamTask<IN, OUT, OP extends OneInputStreamOperator<IN, OUT> & Bo
     protected void cancelTask() {}
 
     @Override
-    protected void cleanup() throws Exception {
+    protected void cleanUpInternal() throws Exception {
         mainOperator.close();
     }
 

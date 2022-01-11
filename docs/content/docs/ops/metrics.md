@@ -916,10 +916,15 @@ Metrics related to data exchange between task executors using netty network comm
       <td>Gauge</td>
     </tr>
     <tr>
-      <th rowspan="18">Task</th>
-      <td rowspan="4">Shuffle.Netty.Input.Buffers</td>
+      <th rowspan="20">Task</th>
+      <td rowspan="5">Shuffle.Netty.Input.Buffers</td>
       <td>inputQueueLength</td>
       <td>The number of queued input buffers.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>inputQueueSize</td>
+      <td>The real size of queued input buffers in bytes. The size for local input channels is always `0` since the local channel takes records directly from the output queue.</td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -938,9 +943,14 @@ Metrics related to data exchange between task executors using netty network comm
       <td>Gauge</td>
     </tr>
     <tr>
-      <td rowspan="2">Shuffle.Netty.Output.Buffers</td>
+      <td rowspan="3">Shuffle.Netty.Output.Buffers</td>
       <td>outputQueueLength</td>
       <td>The number of queued output buffers.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>outputQueueSize</td>
+      <td>The real size of queued output buffers in bytes. </td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -1051,10 +1061,6 @@ Metrics related to data exchange between task executors using netty network comm
 
 ### Availability
 
-{{< hint warning >}}
-If [Reactive Mode]({{< ref "docs/deployment/elastic_scaling" >}}#reactive-mode) is enabled then these metrics, except `numRestarts`, do not work correctly.
-{{< /hint >}}
-
 <table class="table table-bordered">
   <thead>
     <tr>
@@ -1101,10 +1107,6 @@ If [Reactive Mode]({{< ref "docs/deployment/elastic_scaling" >}}#reactive-mode) 
 </table>
 
 ### Checkpointing
-
-{{< hint warning >}}
-If [Reactive Mode]({{< ref "docs/deployment/elastic_scaling" >}}#reactive-mode) is enabled then checkpointing metrics with the `Job` scope do not work correctly.
-{{< /hint >}}
 
 Note that for failed checkpoints, metrics are updated on a best efforts basis and may be not accurate.
 <table class="table table-bordered">
@@ -1193,7 +1195,7 @@ Certain RocksDB native metrics are available but disabled by default, you can fi
       <td>Histogram</td>
     </tr>
     <tr>
-      <th rowspan="16"><strong>Task</strong></th>
+      <th rowspan="20"><strong>Task</strong></th>
       <td>numBytesInLocal</td>
       <td><span class="label label-danger">Attention:</span> deprecated, use <a href="{{< ref "docs/ops/metrics" >}}#default-shuffle-service">Default shuffle service metrics</a>.</td>
       <td>Counter</td>
@@ -1264,18 +1266,38 @@ Certain RocksDB native metrics are available but disabled by default, you can fi
       <td>Meter</td>
     </tr>
     <tr>
-      <td>backPressuredTimeMsPerSecond</td>
-      <td>The time (in milliseconds) this task is back pressured per second.</td>
-      <td>Gauge</td>
-    </tr>
-    <tr>
       <td>busyTimeMsPerSecond</td>
       <td>The time (in milliseconds) this task is busy (neither idle nor back pressured) per second. Can be NaN, if the value could not be calculated.</td>
       <td>Gauge</td>
     </tr>
     <tr>
+      <td>backPressuredTimeMsPerSecond</td>
+      <td>The time (in milliseconds) this task is back pressured (soft or hard) per second. It's a sum of softBackPressuredTimeMsPerSecond and hardBackPressuredTimeMsPerSecond.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>softBackPressuredTimeMsPerSecond</td>
+      <td>The time (in milliseconds) this task is softly back pressured per second. Softly back pressured task will be still responsive and capable of for example triggering unaligned checkpoints.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>hardBackPressuredTimeMsPerSecond</td>
+      <td>The time (in milliseconds) this task is back pressured in a hard way per second. During hard back pressured task is completely blocked and unresponsive preventing for example unaligned checkpoints from triggering.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>maxSoftBackPressuredTimeMs</td>
+      <td>Maximum recorded duration of a single consecutive period of the task being softly back pressured in the last sampling period. Please check softBackPressuredTimeMsPerSecond and hardBackPressuredTimeMsPerSecond for more information.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>maxHardBackPressuredTimeMs</td>
+      <td>Maximum recorded duration of a single consecutive period of the task being in the hard back pressure state in the last sampling period. Please check softBackPressuredTimeMsPerSecond and hardBackPressuredTimeMsPerSecond for more information.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
       <td rowspan="2"><strong>Task (only if buffer debloating is enabled and in non-source tasks)</strong></td>
-      <td>estimatedTimeToConsumerBuffersMs</td>
+      <td>estimatedTimeToConsumeBuffersMs</td>
       <td>The estimated time (in milliseconds) by the buffer debloater to consume all of the buffered data in the network exchange preceding this task. This value is calculated by approximated amount of the in-flight data and calculated throughput.</td>
       <td>Gauge</td>
     </tr>
@@ -1345,52 +1367,7 @@ Certain RocksDB native metrics are available but disabled by default, you can fi
 ### Connectors
 
 #### Kafka Connectors
-<table class="table table-bordered">
-  <thead>
-    <tr>
-      <th class="text-left" style="width: 15%">Scope</th>
-      <th class="text-left" style="width: 18%">Metrics</th>
-      <th class="text-left" style="width: 18%">User Variables</th>
-      <th class="text-left" style="width: 39%">Description</th>
-      <th class="text-left" style="width: 10%">Type</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th rowspan="1">Operator</th>
-      <td>commitsSucceeded</td>
-      <td>n/a</td>
-      <td>The total number of successful offset commits to Kafka, if offset committing is turned on and checkpointing is enabled.</td>
-      <td>Counter</td>
-    </tr>
-    <tr>
-       <th rowspan="1">Operator</th>
-       <td>commitsFailed</td>
-       <td>n/a</td>
-       <td>The total number of offset commit failures to Kafka, if offset committing is
-       turned on and checkpointing is enabled. Note that committing offsets back to Kafka
-       is only a means to expose consumer progress, so a commit failure does not affect
-       the integrity of Flink's checkpointed partition offsets.</td>
-       <td>Counter</td>
-    </tr>
-    <tr>
-       <th rowspan="1">Operator</th>
-       <td>committedOffsets</td>
-       <td>topic, partition</td>
-       <td>The last successfully committed offsets to Kafka, for each partition.
-       A particular partition's metric can be specified by topic name and partition id.</td>
-       <td>Gauge</td>
-    </tr>
-    <tr>
-      <th rowspan="1">Operator</th>
-      <td>currentOffsets</td>
-      <td>topic, partition</td>
-      <td>The consumer's current read offset, for each partition. A particular
-      partition's metric can be specified by topic name and partition id.</td>
-      <td>Gauge</td>
-    </tr>
-  </tbody>
-</table>
+Please refer to [Kafka monitoring]({{< ref "docs/connectors/datastream/kafka" >}}/#monitoring).
 
 #### Kinesis Connectors
 <table class="table table-bordered">

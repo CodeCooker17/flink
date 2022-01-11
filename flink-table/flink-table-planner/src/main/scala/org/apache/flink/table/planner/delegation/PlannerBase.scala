@@ -23,12 +23,14 @@ import org.apache.flink.api.dag.Transformation
 import org.apache.flink.configuration.ReadableConfig
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.flink.table.api.config.{ExecutionConfigOptions, TableConfigOptions}
-import org.apache.flink.table.api.{PlannerType, SqlDialect, TableConfig, TableEnvironment, TableException}
+import org.apache.flink.table.api._
 import org.apache.flink.table.catalog._
+import org.apache.flink.table.catalog.ManagedTableListener.isManagedTable
 import org.apache.flink.table.connector.sink.DynamicTableSink
 import org.apache.flink.table.delegation.{Executor, Parser, Planner}
 import org.apache.flink.table.descriptors.{ConnectorDescriptorValidator, DescriptorProperties}
-import org.apache.flink.table.factories.{FactoryUtil, TableFactoryUtil}
+import org.apache.flink.table.factories.{DynamicTableSinkFactory, FactoryUtil, TableFactoryUtil}
+import org.apache.flink.table.module.{Module, ModuleManager}
 import org.apache.flink.table.operations.OutputConversionModifyOperation.UpdateMode
 import org.apache.flink.table.operations._
 import org.apache.flink.table.planner.JMap
@@ -50,7 +52,7 @@ import org.apache.flink.table.planner.plan.utils.SameRelObjectShuttle
 import org.apache.flink.table.planner.sinks.DataStreamTableSink
 import org.apache.flink.table.planner.sinks.TableSinkUtils.{inferSinkPhysicalSchema, validateLogicalPhysicalTypesCompatible, validateTableSink}
 import org.apache.flink.table.planner.utils.InternalConfigOptions.{TABLE_QUERY_START_EPOCH_TIME, TABLE_QUERY_START_LOCAL_TIME}
-import org.apache.flink.table.planner.utils.JavaScalaConversionUtil
+import org.apache.flink.table.planner.utils.JavaScalaConversionUtil.{toJava, toScala}
 import org.apache.flink.table.sinks.TableSink
 import org.apache.flink.table.types.utils.LegacyTypeInfoDataTypeConverter
 
@@ -75,6 +77,7 @@ import _root_.scala.collection.JavaConversions._
   *                        [[StreamExecutionEnvironment]] for
   *                        [[org.apache.flink.table.sources.StreamTableSource.getDataStream]]
   * @param config          mutable configuration passed from corresponding [[TableEnvironment]]
+  * @param moduleManager   manager for modules
   * @param functionCatalog catalog of functions
   * @param catalogManager  manager of catalog meta objects such as tables, views, databases etc.
   * @param isStreamingMode Determines if the planner should work in a batch (false}) or
@@ -83,6 +86,7 @@ import _root_.scala.collection.JavaConversions._
 abstract class PlannerBase(
     executor: Executor,
     config: TableConfig,
+    val moduleManager: ModuleManager,
     val functionCatalog: FunctionCatalog,
     val catalogManager: CatalogManager,
     isStreamingMode: Boolean)
@@ -103,6 +107,7 @@ abstract class PlannerBase(
     new PlannerContext(
       !isStreamingMode,
       config,
+      moduleManager,
       functionCatalog,
       catalogManager,
       asRootSchema(new CatalogManagerCalciteSchema(catalogManager, isStreamingMode)),
@@ -157,8 +162,8 @@ abstract class PlannerBase(
 
   def createNewParser: Parser = {
     val factoryIdentifier = getTableConfig.getSqlDialect.name().toLowerCase
-    val parserFactory = FactoryUtil.discoverFactory(Thread.currentThread.getContextClassLoader,
-      classOf[ParserFactory], factoryIdentifier)
+    val parserFactory = FactoryUtil.discoverFactory(
+      getClass.getClassLoader, classOf[ParserFactory], factoryIdentifier)
 
     val context = new DefaultParserContext(catalogManager, plannerContext)
     parserFactory.create(context)
@@ -213,7 +218,12 @@ abstract class PlannerBase(
       case collectModifyOperation: CollectModifyOperation =>
         val input = getRelBuilder.queryOperation(modifyOperation.getChild).build()
         DynamicSinkUtils.convertCollectToRel(
-          getRelBuilder, input, collectModifyOperation, getTableConfig.getConfiguration)
+          getRelBuilder,
+          input,
+          collectModifyOperation,
+          getTableConfig.getConfiguration,
+          getClassLoader
+        )
 
       case catalogSink: CatalogSinkModifyOperation =>
         val input = getRelBuilder.queryOperation(modifyOperation.getChild).build()
@@ -353,7 +363,7 @@ abstract class PlannerBase(
       dynamicOptions: JMap[String, String])
     : Option[(ResolvedCatalogTable, Any)] = {
     val optionalLookupResult =
-      JavaScalaConversionUtil.toScala(catalogManager.getTable(objectIdentifier))
+      toScala(catalogManager.getTable(objectIdentifier))
     if (optionalLookupResult.isEmpty) {
       return None
     }
@@ -361,7 +371,7 @@ abstract class PlannerBase(
     lookupResult.getTable match {
       case connectorTable: ConnectorCatalogTable[_, _] =>
         val resolvedTable = lookupResult.getResolvedTable.asInstanceOf[ResolvedCatalogTable]
-        JavaScalaConversionUtil.toScala(connectorTable.getTableSink) match {
+        toScala(connectorTable.getTableSink) match {
           case Some(sink) => Some(resolvedTable, sink)
           case None => None
         }
@@ -373,11 +383,20 @@ abstract class PlannerBase(
         } else {
           resolvedTable
         }
-        val catalog = catalogManager.getCatalog(objectIdentifier.getCatalogName)
+        val catalog = toScala(catalogManager.getCatalog(objectIdentifier.getCatalogName))
         val isTemporary = lookupResult.isTemporary
+
+        if (isStreamingMode && isManagedTable(catalog.get, resolvedTable) &&
+          !executor.isCheckpointingEnabled) {
+          throw new TableException(
+            s"You should enable the checkpointing for sinking to managed table " +
+              s"${objectIdentifier}, managed table relies on checkpoint to commit and " +
+              s"the data is visible only after commit.")
+        }
+
         if (isLegacyConnectorOptions(objectIdentifier, resolvedTable.getOrigin, isTemporary)) {
           val tableSink = TableFactoryUtil.findAndCreateTableSink(
-            catalog.orElse(null),
+            catalog.orNull,
             objectIdentifier,
             tableToFind.getOrigin,
             getTableConfig.getConfiguration,
@@ -385,8 +404,20 @@ abstract class PlannerBase(
             isTemporary)
           Option(resolvedTable, tableSink)
         } else {
-          val tableSink = FactoryUtil.createTableSink(
-            catalog.orElse(null),
+          val factoryFromCatalog = catalog.flatMap(f => toScala(f.getFactory)) match {
+            case Some(f: DynamicTableSinkFactory) => Some(f)
+            case _ => None
+          }
+
+          val factoryFromModule = toScala(plannerContext.getFlinkContext.getModuleManager
+            .getFactory(toJava((m: Module) => m.getTableSinkFactory)))
+
+          // Since the catalog is more specific, we give it precedence over a factory provided by
+          // any modules.
+          val factory = factoryFromCatalog.orElse(factoryFromModule).orNull
+
+          val tableSink = FactoryUtil.createDynamicTableSink(
+            factory,
             objectIdentifier,
             tableToFind,
             getTableConfig.getConfiguration,

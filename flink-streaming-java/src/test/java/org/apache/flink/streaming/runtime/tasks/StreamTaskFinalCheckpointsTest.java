@@ -21,8 +21,10 @@ package org.apache.flink.streaming.runtime.tasks;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.time.Deadline;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeutils.base.StringSerializer;
+import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
 import org.apache.flink.runtime.checkpoint.CheckpointMetricsBuilder;
@@ -33,14 +35,18 @@ import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.api.EndOfData;
 import org.apache.flink.runtime.io.network.api.EndOfPartitionEvent;
+import org.apache.flink.runtime.io.network.api.StopMode;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.partition.PartitionTestUtils;
 import org.apache.flink.runtime.io.network.partition.PipelinedResultPartition;
 import org.apache.flink.runtime.io.network.partition.ResultPartition;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.io.network.partition.consumer.TestInputChannel;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
 import org.apache.flink.runtime.state.StateInitializationContext;
-import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
+import org.apache.flink.runtime.taskmanager.TestCheckpointResponder;
+import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -54,20 +60,25 @@ import org.junit.Test;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.api.common.typeinfo.BasicTypeInfo.STRING_TYPE_INFO;
 import static org.apache.flink.runtime.state.CheckpointStorageLocationReference.getDefault;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /** Tests the behavior of {@link StreamTask} related to final checkpoint. */
 public class StreamTaskFinalCheckpointsTest {
+
+    private static final long CONCURRENT_EVENT_WAIT_PERIOD_MS = 500L;
 
     @Test
     public void testCheckpointDoneOnFinishedOperator() throws Exception {
@@ -82,7 +93,8 @@ public class StreamTaskFinalCheckpointsTest {
         harness.setAutoProcess(false);
         harness.processElement(new StreamRecord<>(1));
 
-        harness.streamTask.operatorChain.finishOperators(harness.streamTask.getActionExecutor());
+        harness.streamTask.operatorChain.finishOperators(
+                harness.streamTask.getActionExecutor(), StopMode.DRAIN);
         assertTrue(FinishingOperator.finished);
 
         harness.getTaskStateManager().getWaitForReportLatch().reset();
@@ -151,7 +163,7 @@ public class StreamTaskFinalCheckpointsTest {
                 assertEquals(2, testHarness.getTaskStateManager().getReportedCheckpointId());
 
                 // Tests triggering checkpoint after some inputs have received EndOfPartition.
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 0);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 0);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 0);
                 checkpointFuture = triggerCheckpoint(testHarness, 4);
                 processMailTillCheckpointSucceeds(testHarness, checkpointFuture);
@@ -159,8 +171,8 @@ public class StreamTaskFinalCheckpointsTest {
 
                 // Tests triggering checkpoint after received all the inputs have received
                 // EndOfPartition.
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 1);
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 2);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 1);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 2);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 1);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 2);
                 checkpointFuture = triggerCheckpoint(testHarness, lastCheckpointId);
@@ -220,11 +232,6 @@ public class StreamTaskFinalCheckpointsTest {
                                     config.setCheckpointingEnabled(true);
                                     config.setUnalignedCheckpointsEnabled(
                                             enableUnalignedCheckpoint);
-                                    config.getConfiguration()
-                                            .set(
-                                                    ExecutionCheckpointingOptions
-                                                            .ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH,
-                                                    true);
                                 })
                         .setCheckpointResponder(checkpointResponder)
                         .setupOperatorChain(new EmptyOperator())
@@ -330,7 +337,7 @@ public class StreamTaskFinalCheckpointsTest {
                                 try {
                                     // Give some potential time for the task to finish before the
                                     // savepoint is notified complete
-                                    Thread.sleep(500);
+                                    Thread.sleep(CONCURRENT_EVENT_WAIT_PERIOD_MS);
                                 } catch (InterruptedException e) {
                                     throw new FlinkRuntimeException(e);
                                 }
@@ -365,7 +372,7 @@ public class StreamTaskFinalCheckpointsTest {
 
                 // trigger the synchronous savepoint
                 CompletableFuture<Boolean> savepointFuture =
-                        triggerStopWithSavepoint(testHarness, syncSavepointId);
+                        triggerStopWithSavepointDrain(testHarness, syncSavepointId);
 
                 // The checkpoint 6 would be triggered successfully.
                 testHarness.finishProcessing();
@@ -396,6 +403,17 @@ public class StreamTaskFinalCheckpointsTest {
     @Test
     public void testTriggerStopWithSavepointWhenWaitingForFinalCheckpointOnSourceTask()
             throws Exception {
+        doTestTriggerStopWithSavepointWhenWaitingForFinalCheckpointOnSourceTask(true);
+    }
+
+    @Test
+    public void testTriggerStopWithSavepointNoDrainWhenWaitingForFinalCheckpointOnSourceTask()
+            throws Exception {
+        doTestTriggerStopWithSavepointWhenWaitingForFinalCheckpointOnSourceTask(false);
+    }
+
+    private void doTestTriggerStopWithSavepointWhenWaitingForFinalCheckpointOnSourceTask(
+            boolean drain) throws Exception {
         int finalCheckpointId = 6;
         int syncSavepointId = 7;
         CompletingCheckpointResponder checkpointResponder =
@@ -419,7 +437,7 @@ public class StreamTaskFinalCheckpointsTest {
                             try {
                                 // Give some potential time for the task to finish before the
                                 // savepoint is notified complete
-                                Thread.sleep(500);
+                                Thread.sleep(CONCURRENT_EVENT_WAIT_PERIOD_MS);
                             } catch (InterruptedException e) {
                                 throw new FlinkRuntimeException(e);
                             }
@@ -438,11 +456,6 @@ public class StreamTaskFinalCheckpointsTest {
                         .modifyStreamConfig(
                                 config -> {
                                     config.setCheckpointingEnabled(true);
-                                    config.getConfiguration()
-                                            .set(
-                                                    ExecutionCheckpointingOptions
-                                                            .ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH,
-                                                    true);
                                 })
                         .setCheckpointResponder(checkpointResponder)
                         .setupOutputForSingletonOperatorChain(
@@ -464,7 +477,9 @@ public class StreamTaskFinalCheckpointsTest {
 
             // trigger the synchronous savepoint
             CompletableFuture<Boolean> savepointFuture =
-                    triggerStopWithSavepoint(testHarness, syncSavepointId);
+                    drain
+                            ? triggerStopWithSavepointDrain(testHarness, syncSavepointId)
+                            : triggerStopWithSavepointNoDrain(testHarness, syncSavepointId);
 
             // The checkpoint 6 would be triggered successfully.
             testHarness.finishProcessing();
@@ -490,14 +505,18 @@ public class StreamTaskFinalCheckpointsTest {
     @Test
     public void testTriggeringUnalignedCheckpointWithFinishedChannels() throws Exception {
         testTriggeringCheckpointWithFinishedChannels(
-                CheckpointOptions.unaligned(CheckpointStorageLocationReference.getDefault()));
+                CheckpointOptions.unaligned(
+                        CheckpointType.CHECKPOINT,
+                        CheckpointStorageLocationReference.getDefault()));
     }
 
     @Test
     public void testTriggeringAlignedWithTimeoutCheckpointWithFinishedChannels() throws Exception {
         testTriggeringCheckpointWithFinishedChannels(
                 CheckpointOptions.alignedWithTimeout(
-                        CheckpointStorageLocationReference.getDefault(), 10L));
+                        CheckpointType.CHECKPOINT,
+                        CheckpointStorageLocationReference.getDefault(),
+                        10L));
     }
 
     private void testTriggeringCheckpointWithFinishedChannels(CheckpointOptions checkpointOptions)
@@ -510,7 +529,6 @@ public class StreamTaskFinalCheckpointsTest {
                 partitionWriters[i].setup();
             }
 
-            int lastCheckpointId = 6;
             try (StreamTaskMailboxTestHarness<String> testHarness =
                     createTestHarness(
                             partitionWriters,
@@ -518,27 +536,39 @@ public class StreamTaskFinalCheckpointsTest {
                             checkpointOptions.isUnalignedCheckpoint()
                                     || checkpointOptions.isTimeoutable())) {
 
+                int numChannels =
+                        testHarness.inputGates[0].getInputGate().getNumberOfInputChannels();
+                int[] resumedCount = new int[numChannels];
+                for (int i = 0; i < numChannels; ++i) {
+                    TestInputChannel inputChannel =
+                            (TestInputChannel)
+                                    testHarness.inputGates[0].getInputGate().getChannel(i);
+                    inputChannel.setActionOnResumed(
+                            () -> resumedCount[inputChannel.getChannelIndex()]++);
+                }
+
                 // Tests triggering checkpoint when all the inputs are alive.
                 CompletableFuture<Boolean> checkpointFuture =
                         triggerCheckpoint(testHarness, 2, checkpointOptions);
                 processMailTillCheckpointSucceeds(testHarness, checkpointFuture);
                 assertEquals(2, testHarness.getTaskStateManager().getReportedCheckpointId());
+                assertArrayEquals(new int[] {0, 0, 0}, resumedCount);
 
                 // Tests triggering checkpoint after some inputs have received EndOfPartition.
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 0);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 0);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 0);
                 checkpointFuture = triggerCheckpoint(testHarness, 4, checkpointOptions);
                 processMailTillCheckpointSucceeds(testHarness, checkpointFuture);
                 assertEquals(4, testHarness.getTaskStateManager().getReportedCheckpointId());
+                assertArrayEquals(new int[] {0, 0, 0}, resumedCount);
 
                 // Tests triggering checkpoint after received all the inputs have received
                 // EndOfPartition.
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 1);
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 2);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 1);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 2);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 1);
                 testHarness.processEvent(EndOfPartitionEvent.INSTANCE, 0, 2);
-                checkpointFuture =
-                        triggerCheckpoint(testHarness, lastCheckpointId, checkpointOptions);
+                checkpointFuture = triggerCheckpoint(testHarness, 6, checkpointOptions);
 
                 // Notifies the result partition that all records are processed after the
                 // last checkpoint is triggered.
@@ -554,6 +584,7 @@ public class StreamTaskFinalCheckpointsTest {
                 assertTrue(checkpointFuture.isDone());
                 testHarness.getTaskStateManager().getWaitForReportLatch().await();
                 assertEquals(6, testHarness.getTaskStateManager().getReportedCheckpointId());
+                assertArrayEquals(new int[] {0, 0, 0}, resumedCount);
 
                 // Each result partition should have emitted 3 barriers and 1 EndOfUserRecordsEvent.
                 for (ResultPartition resultPartition : partitionWriters) {
@@ -587,15 +618,7 @@ public class StreamTaskFinalCheckpointsTest {
                             .addInput(BasicTypeInfo.STRING_TYPE_INFO, 1)
                             .addAdditionalOutput(partitionWriters)
                             .setCheckpointResponder(checkpointResponder)
-                            .modifyStreamConfig(
-                                    config -> {
-                                        config.setCheckpointingEnabled(true);
-                                        config.getConfiguration()
-                                                .set(
-                                                        ExecutionCheckpointingOptions
-                                                                .ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH,
-                                                        true);
-                                    })
+                            .modifyStreamConfig(config -> config.setCheckpointingEnabled(true))
                             .setupOperatorChain(new StatefulOperator())
                             .finishForSingletonOperatorChain(StringSerializer.INSTANCE)
                             .build()) {
@@ -613,13 +636,13 @@ public class StreamTaskFinalCheckpointsTest {
                                 .getTaskStateManager()
                                 .getJobManagerTaskStateSnapshotsByCheckpointId()
                                 .get(2L)
-                                .isOperatorsFinished());
+                                .isTaskFinished());
 
                 // Trigger the first checkpoint after we call operators' finish method.
                 // The checkpoint is added to the mailbox and will be processed in the
                 // mailbox loop after call operators' finish method in the afterInvoke()
                 // method.
-                testHarness.processEvent(EndOfData.INSTANCE, 0, 0);
+                testHarness.processEvent(new EndOfData(StopMode.DRAIN), 0, 0);
                 checkpointFuture = triggerCheckpoint(testHarness, 4);
                 checkpointFuture.thenAccept(
                         (ignored) -> {
@@ -636,7 +659,7 @@ public class StreamTaskFinalCheckpointsTest {
                                 .getTaskStateManager()
                                 .getJobManagerTaskStateSnapshotsByCheckpointId()
                                 .get(4L)
-                                .isOperatorsFinished());
+                                .isTaskFinished());
             }
 
         } finally {
@@ -666,16 +689,29 @@ public class StreamTaskFinalCheckpointsTest {
                         checkpointOptions);
     }
 
-    static CompletableFuture<Boolean> triggerStopWithSavepoint(
+    static CompletableFuture<Boolean> triggerStopWithSavepointDrain(
             StreamTaskMailboxTestHarness<String> testHarness, long checkpointId) {
+        return triggerStopWithSavepoint(
+                testHarness, checkpointId, CheckpointType.SAVEPOINT_TERMINATE);
+    }
+
+    static CompletableFuture<Boolean> triggerStopWithSavepointNoDrain(
+            StreamTaskMailboxTestHarness<String> testHarness, long checkpointId) {
+        return triggerStopWithSavepoint(
+                testHarness, checkpointId, CheckpointType.SAVEPOINT_SUSPEND);
+    }
+
+    static CompletableFuture<Boolean> triggerStopWithSavepoint(
+            StreamTaskMailboxTestHarness<String> testHarness,
+            long checkpointId,
+            CheckpointType checkpointType) {
         testHarness.getTaskStateManager().getWaitForReportLatch().reset();
         return testHarness
                 .getStreamTask()
                 .triggerCheckpointAsync(
                         new CheckpointMetaData(checkpointId, checkpointId * 1000),
                         CheckpointOptions.alignedNoTimeout(
-                                CheckpointType.SAVEPOINT_TERMINATE,
-                                CheckpointStorageLocationReference.getDefault()));
+                                checkpointType, CheckpointStorageLocationReference.getDefault()));
     }
 
     static void processMailTillCheckpointSucceeds(
@@ -703,7 +739,7 @@ public class StreamTaskFinalCheckpointsTest {
                             try {
                                 // Give some potential time for the task to finish before the
                                 // checkpoint is acknowledged, also do not notify its completion
-                                Thread.sleep(500);
+                                Thread.sleep(CONCURRENT_EVENT_WAIT_PERIOD_MS);
                             } catch (InterruptedException e) {
                                 throw new FlinkRuntimeException(e);
                             }
@@ -753,8 +789,9 @@ public class StreamTaskFinalCheckpointsTest {
                         .addInput(BasicTypeInfo.STRING_TYPE_INFO, 3)
                         .setCollectNetworkEvents()
                         .setTaskStateSnapshot(1, TaskStateSnapshot.FINISHED_ON_RESTORE)
-                        .setupOutputForSingletonOperatorChain(
-                                new TestFinishedOnRestoreStreamOperator())
+                        .setupOperatorChain(new TestFinishedOnRestoreStreamOperator())
+                        .chain(new TestFinishedOnRestoreStreamOperator(), StringSerializer.INSTANCE)
+                        .finish()
                         .build()) {
             // Finish the restore, including state initialization and open.
             harness.processAll();
@@ -793,7 +830,73 @@ public class StreamTaskFinalCheckpointsTest {
                                     checkpointMetaData.getTimestamp(),
                                     checkpointOptions),
                             Watermark.MAX_WATERMARK,
-                            EndOfData.INSTANCE));
+                            new EndOfData(StopMode.DRAIN)));
+        }
+    }
+
+    /**
+     * This test verifies for tasks that finished on restore, when taking unaligned checkpoint the
+     * asynchronous part would wait for the channel states futures get completed, which means the
+     * barriers are aligned.
+     */
+    @Test
+    public void testWaitingForUnalignedChannelStatesIfFinishedOnRestore() throws Exception {
+        OperatorID operatorId = new OperatorID();
+        try (StreamTaskMailboxTestHarness<String> harness =
+                new StreamTaskMailboxTestHarnessBuilder<>(
+                                OneInputStreamTask::new, BasicTypeInfo.STRING_TYPE_INFO)
+                        .modifyStreamConfig(
+                                streamConfig -> streamConfig.setUnalignedCheckpointsEnabled(true))
+                        .addInput(BasicTypeInfo.STRING_TYPE_INFO, 3)
+                        .setCollectNetworkEvents()
+                        .setTaskStateSnapshot(1, TaskStateSnapshot.FINISHED_ON_RESTORE)
+                        .setupOperatorChain(new TestFinishedOnRestoreStreamOperator())
+                        .chain(
+                                operatorId,
+                                new TestFinishedOnRestoreStreamOperator(operatorId),
+                                StringSerializer.INSTANCE)
+                        .finish()
+                        .build()) {
+            // Finish the restore, including state initialization and open.
+            harness.processAll();
+
+            TestCheckpointResponder checkpointResponder = harness.getCheckpointResponder();
+            checkpointResponder.setAcknowledgeLatch(new OneShotLatch());
+            checkpointResponder.setDeclinedLatch(new OneShotLatch());
+
+            CheckpointBarrier unalignedBarrier =
+                    new CheckpointBarrier(
+                            2,
+                            2,
+                            CheckpointOptions.unaligned(CheckpointType.CHECKPOINT, getDefault()));
+
+            // On first unaligned barrier, the task would take snapshot and start the asynchronous
+            // part. We slightly extend the process to make the asynchronous part start executing
+            // before the other barriers arrived.
+            harness.processEvent(unalignedBarrier, 0, 0);
+            Thread.sleep(CONCURRENT_EVENT_WAIT_PERIOD_MS);
+
+            // Finish the unaligned checkpoint.
+            harness.processEvent(unalignedBarrier, 0, 1);
+            harness.processEvent(unalignedBarrier, 0, 2);
+
+            // Wait till the asynchronous part finished either normally or exceptionally.
+            CommonTestUtils.waitUntilCondition(
+                    () ->
+                            checkpointResponder.getAcknowledgeLatch().isTriggered()
+                                    || checkpointResponder.getDeclinedLatch().isTriggered(),
+                    Deadline.fromNow(Duration.ofSeconds(10)));
+
+            assertEquals(
+                    Collections.singletonList(2L),
+                    checkpointResponder.getAcknowledgeReports().stream()
+                            .map(TestCheckpointResponder.AbstractReport::getCheckpointId)
+                            .collect(Collectors.toList()));
+            assertEquals(
+                    Collections.emptyList(),
+                    checkpointResponder.getDeclineReports().stream()
+                            .map(TestCheckpointResponder.AbstractReport::getCheckpointId)
+                            .collect(Collectors.toList()));
         }
     }
 

@@ -36,8 +36,8 @@ import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.utils.EncodingUtils;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.module.SimpleModule;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectReader;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectWriter;
 
 import org.apache.calcite.avatica.util.ByteString;
 import org.apache.calcite.avatica.util.TimeUnit;
@@ -78,6 +78,7 @@ public class RexNodeSerdeTest {
     @Parameterized.Parameters(name = "{0}")
     public static Object[][] parameters() {
         TableConfig tableConfig = TableConfig.getDefault();
+        ModuleManager moduleManager = new ModuleManager();
         CatalogManager catalogManager =
                 CatalogManager.newBuilder()
                         .classLoader(Thread.currentThread().getContextClassLoader())
@@ -88,7 +89,8 @@ public class RexNodeSerdeTest {
                 new FlinkContextImpl(
                         false,
                         tableConfig,
-                        new FunctionCatalog(tableConfig, catalogManager, new ModuleManager()),
+                        moduleManager,
+                        new FunctionCatalog(tableConfig, catalogManager, moduleManager),
                         catalogManager,
                         null); // toRexFactory
         RexBuilder rexBuilder = new RexBuilder(FACTORY);
@@ -368,20 +370,15 @@ public class RexNodeSerdeTest {
                         Thread.currentThread().getContextClassLoader(),
                         FACTORY,
                         FlinkSqlOperatorTable.instance());
-        ObjectMapper mapper = JsonSerdeUtil.createObjectMapper(serdeCtx);
-        SimpleModule module = new SimpleModule();
+        ObjectReader objectReader = JsonSerdeUtil.createObjectReader(serdeCtx);
+        ObjectWriter objectWriter = JsonSerdeUtil.createObjectWriter(serdeCtx);
 
-        module.addSerializer(new RexNodeJsonSerializer());
-        module.addSerializer(new RelDataTypeJsonSerializer());
-        module.addDeserializer(RexNode.class, new RexNodeJsonDeserializer());
-        module.addDeserializer(RelDataType.class, new RelDataTypeJsonDeserializer());
-        mapper.registerModule(module);
         StringWriter writer = new StringWriter(100);
-        try (JsonGenerator gen = mapper.getFactory().createGenerator(writer)) {
+        try (JsonGenerator gen = objectWriter.getFactory().createGenerator(writer)) {
             gen.writeObject(rexNode);
         }
         String json = writer.toString();
-        RexNode actual = mapper.readValue(json, RexNode.class);
+        RexNode actual = objectReader.readValue(json, RexNode.class);
         assertEquals(rexNode, actual);
     }
 

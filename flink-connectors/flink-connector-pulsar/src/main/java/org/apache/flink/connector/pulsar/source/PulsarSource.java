@@ -28,7 +28,6 @@ import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.pulsar.common.config.ConfigurationDataCustomizer;
 import org.apache.flink.connector.pulsar.source.config.SourceConfiguration;
 import org.apache.flink.connector.pulsar.source.enumerator.PulsarSourceEnumState;
 import org.apache.flink.connector.pulsar.source.enumerator.PulsarSourceEnumStateSerializer;
@@ -44,9 +43,6 @@ import org.apache.flink.connector.pulsar.source.reader.deserializer.PulsarDeseri
 import org.apache.flink.connector.pulsar.source.split.PulsarPartitionSplit;
 import org.apache.flink.connector.pulsar.source.split.PulsarPartitionSplitSerializer;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
-
-import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
-import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
 
 /**
  * The Source implementation of Pulsar. Please use a {@link PulsarSourceBuilder} to construct a
@@ -96,14 +92,6 @@ public final class PulsarSource<OUT>
     /** The pulsar deserialization schema used for deserializing message. */
     private final PulsarDeserializationSchema<OUT> deserializationSchema;
 
-    /** Modify the flink generated {@link ClientConfigurationData}. */
-    private final ConfigurationDataCustomizer<ClientConfigurationData>
-            clientConfigurationCustomizer;
-
-    /** Modify the flink generated {@link ConsumerConfigurationData}. */
-    private final ConfigurationDataCustomizer<ConsumerConfigurationData<byte[]>>
-            consumerConfigurationCustomizer;
-
     /**
      * The constructor for PulsarSource, it's package protected for forcing using {@link
      * PulsarSourceBuilder}.
@@ -115,10 +103,7 @@ public final class PulsarSource<OUT>
             StartCursor startCursor,
             StopCursor stopCursor,
             Boundedness boundedness,
-            PulsarDeserializationSchema<OUT> deserializationSchema,
-            ConfigurationDataCustomizer<ClientConfigurationData> clientConfigurationCustomizer,
-            ConfigurationDataCustomizer<ConsumerConfigurationData<byte[]>>
-                    consumerConfigurationCustomizer) {
+            PulsarDeserializationSchema<OUT> deserializationSchema) {
 
         this.configuration = configuration;
         this.sourceConfiguration = new SourceConfiguration(configuration);
@@ -128,8 +113,6 @@ public final class PulsarSource<OUT>
         this.stopCursor = stopCursor;
         this.boundedness = boundedness;
         this.deserializationSchema = deserializationSchema;
-        this.clientConfigurationCustomizer = clientConfigurationCustomizer;
-        this.consumerConfigurationCustomizer = consumerConfigurationCustomizer;
     }
 
     /**
@@ -155,25 +138,20 @@ public final class PulsarSource<OUT>
                 new PulsarDeserializationSchemaInitializationContext(readerContext));
 
         return PulsarSourceReaderFactory.create(
-                readerContext,
-                deserializationSchema,
-                configuration,
-                sourceConfiguration,
-                clientConfigurationCustomizer,
-                consumerConfigurationCustomizer);
+                readerContext, deserializationSchema, configuration, sourceConfiguration);
     }
 
     @Override
     public SplitEnumerator<PulsarPartitionSplit, PulsarSourceEnumState> createEnumerator(
             SplitEnumeratorContext<PulsarPartitionSplit> enumContext) {
         SplitsAssignmentState assignmentState =
-                new SplitsAssignmentState(startCursor, stopCursor, sourceConfiguration);
+                new SplitsAssignmentState(stopCursor, sourceConfiguration);
         return new PulsarSourceEnumerator(
                 subscriber,
+                startCursor,
                 rangeGenerator,
                 configuration,
                 sourceConfiguration,
-                clientConfigurationCustomizer,
                 enumContext,
                 assignmentState);
     }
@@ -183,13 +161,13 @@ public final class PulsarSource<OUT>
             SplitEnumeratorContext<PulsarPartitionSplit> enumContext,
             PulsarSourceEnumState checkpoint) {
         SplitsAssignmentState assignmentState =
-                new SplitsAssignmentState(startCursor, stopCursor, sourceConfiguration, checkpoint);
+                new SplitsAssignmentState(stopCursor, sourceConfiguration, checkpoint);
         return new PulsarSourceEnumerator(
                 subscriber,
+                startCursor,
                 rangeGenerator,
                 configuration,
                 sourceConfiguration,
-                clientConfigurationCustomizer,
                 enumContext,
                 assignmentState);
     }
