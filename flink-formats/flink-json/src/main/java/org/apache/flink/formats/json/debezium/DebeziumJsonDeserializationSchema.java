@@ -56,10 +56,10 @@ import static java.lang.String.format;
 public final class DebeziumJsonDeserializationSchema implements DeserializationSchema<RowData> {
     private static final long serialVersionUID = 1L;
 
-    private static final String OP_READ = "r"; // snapshot read
-    private static final String OP_CREATE = "c"; // insert
-    private static final String OP_UPDATE = "u"; // update
-    private static final String OP_DELETE = "d"; // delete
+    private static final String OP_READ = "READ"; // snapshot read
+    private static final String OP_CREATE = "INSERT"; // insert
+    private static final String OP_UPDATE = "UPDATE"; // update
+    private static final String OP_DELETE = "DELETE"; // delete
 
     private static final String REPLICA_IDENTITY_EXCEPTION =
             "The \"before\" field of %s message is null, "
@@ -140,7 +140,6 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
             } else {
                 payload = row;
             }
-
             GenericRowData before = (GenericRowData) payload.getField(0);
             GenericRowData after = (GenericRowData) payload.getField(1);
             String op = payload.getField(2).toString();
@@ -248,7 +247,7 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
                 DataTypes.ROW(
                         DataTypes.FIELD("before", physicalDataType),
                         DataTypes.FIELD("after", physicalDataType),
-                        DataTypes.FIELD("op", DataTypes.STRING()));
+                        DataTypes.FIELD("eventType", DataTypes.STRING()));
 
         // append fields that are required for reading metadata in the payload
         final List<DataTypes.Field> payloadMetadataFields =

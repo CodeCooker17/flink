@@ -29,6 +29,9 @@ import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.Objects;
 
 import static java.lang.String.format;
@@ -123,7 +126,7 @@ public class DebeziumJsonSerializationSchema implements SerializationSchema<RowD
                 DataTypes.ROW(
                                 DataTypes.FIELD("before", databaseSchema),
                                 DataTypes.FIELD("after", databaseSchema),
-                                DataTypes.FIELD("op", DataTypes.STRING()))
+                                DataTypes.FIELD("eventType", DataTypes.STRING()))
                         .getLogicalType();
     }
 }

@@ -21,7 +21,8 @@ package org.apache.flink.formats.json.debezium;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.formats.common.TimestampFormat;
-import org.apache.flink.formats.json.JsonFormatOptions;
+import org.apache.flink.formats.json.JsonOptions;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
@@ -30,6 +31,7 @@ import org.apache.flink.table.factories.TestDynamicTableFactory;
 import org.apache.flink.table.runtime.connector.sink.SinkRuntimeProviderContext;
 import org.apache.flink.table.runtime.connector.source.ScanRuntimeProviderContext;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.junit.jupiter.api.Test;
@@ -45,8 +47,9 @@ import static org.apache.flink.table.factories.utils.FactoryMocks.PHYSICAL_TYPE;
 import static org.apache.flink.table.factories.utils.FactoryMocks.SCHEMA;
 import static org.apache.flink.table.factories.utils.FactoryMocks.createTableSink;
 import static org.apache.flink.table.factories.utils.FactoryMocks.createTableSource;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 
 /** Tests for {@link DebeziumJsonFormatFactory}. */
 class DebeziumJsonFormatFactoryTest {
@@ -73,11 +76,16 @@ class DebeziumJsonFormatFactoryTest {
                 scanSourceMock.valueFormat.createRuntimeDecoder(
                         ScanRuntimeProviderContext.INSTANCE, PHYSICAL_DATA_TYPE);
 
-        assertThat(actualDeser).isEqualTo(expectedDeser);
-
+        assertEquals(expectedDeser, actualDeser);
+        DataType dataType = fromLogicalToDataType(PHYSICAL_DATA_TYPE.getLogicalType());
         final DebeziumJsonSerializationSchema expectedSer =
                 new DebeziumJsonSerializationSchema(
-                        (RowType) PHYSICAL_DATA_TYPE.getLogicalType(),
+                        (RowType)
+                                DataTypes.ROW(
+                                        DataTypes.FIELD("before", dataType),
+                                        DataTypes.FIELD("after", dataType),
+                                        DataTypes.FIELD("eventType", DataTypes.STRING()))
+                                        .getLogicalType(),
                         TimestampFormat.ISO_8601,
                         JsonFormatOptions.MapNullKeyMode.LITERAL,
                         "null",
