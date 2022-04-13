@@ -44,26 +44,25 @@ import java.util.List;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
-import static org.apache.flink.connector.testutils.formats.SchemaTestUtils.open;
-import static org.apache.flink.table.api.DataTypes.FIELD;
-import static org.apache.flink.table.api.DataTypes.FLOAT;
-import static org.apache.flink.table.api.DataTypes.INT;
-import static org.apache.flink.table.api.DataTypes.ROW;
-import static org.apache.flink.table.api.DataTypes.STRING;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.CoreMatchers.startsWith;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Tests for {@link DebeziumJsonSerializationSchema} and {@link DebeziumJsonDeserializationSchema}.
  */
-class DebeziumJsonSerDeSchemaTest {
+public class DebeziumJsonSerDeSchemaTest {
 
-    private static final DataType PHYSICAL_DATA_TYPE =
-            ROW(
-                    FIELD("id", INT().notNull()),
-                    FIELD("name", STRING()),
-                    FIELD("description", STRING()),
-                    FIELD("weight", FLOAT()));
+    @Rule public ExpectedException thrown = ExpectedException.none();
+    private final DataType PHYSICAL_DATA_TYPE =
+            DataTypes.ROW(
+                    DataTypes.FIELD("contract_id", DataTypes.STRING()),
+                    DataTypes.FIELD("memo", DataTypes.STRING()),
+                    DataTypes.FIELD("eventType", DataTypes.STRING()),
+                    DataTypes.FIELD("binlogSequenceNo", DataTypes.BIGINT())
+            );
 
     @Test
     void testSerializationAndSchemaIncludeDeserialization() throws Exception {
@@ -184,7 +183,7 @@ class DebeziumJsonSerDeSchemaTest {
 
         SimpleCollector collector = new SimpleCollector();
         for (String line : lines) {
-            deserializationSchema.deserialize(line.getBytes(StandardCharsets.UTF_8), collector);
+            deserializationSchema.deserialize(line.getBytes(), collector);
         }
 
         // Debezium captures change data (`debezium-data-schema-include.txt`) on the `product`

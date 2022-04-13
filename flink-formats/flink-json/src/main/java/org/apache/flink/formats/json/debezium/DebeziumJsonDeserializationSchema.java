@@ -27,6 +27,7 @@ import org.apache.flink.formats.json.debezium.DebeziumJsonDecodingFormat.Readabl
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.utils.DataTypeUtils;
@@ -61,6 +62,9 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
     private static final String OP_UPDATE = "UPDATE"; // update
     private static final String OP_DELETE = "DELETE"; // delete
 
+    public static final String BINLOG_SEQUENCE_NO_NAME = "binlogSequenceNo"; // BINLOG_SEQUENCE_NO_NAME
+    public static final String EVENT_TYPE_NAME = "eventType"; // EVENT_TYPE_NAME
+
     private static final String REPLICA_IDENTITY_EXCEPTION =
             "The \"before\" field of %s message is null, "
                     + "if you are using Debezium Postgres Connector, "
@@ -84,6 +88,8 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
      * information, but we just ignore "schema" and extract data from "payload".
      */
     private final boolean schemaInclude;
+    private final int binlogSequenceNoIndex;
+    private final int eventTypeIndex;
 
     /** Flag indicating whether to ignore invalid fields/rows (default: throw an exception). */
     private final boolean ignoreParseErrors;
@@ -97,6 +103,8 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
             TimestampFormat timestampFormat) {
         final RowType jsonRowType =
                 createJsonRowType(physicalDataType, requestedMetadata, schemaInclude);
+        binlogSequenceNoIndex = getSchemaFieldIndex(jsonRowType, BINLOG_SEQUENCE_NO_NAME);
+        eventTypeIndex = getSchemaFieldIndex(jsonRowType, EVENT_TYPE_NAME);
         this.jsonDeserializer =
                 new JsonRowDataDeserializationSchema(
                         jsonRowType,
@@ -113,6 +121,11 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
         this.producedTypeInfo = producedTypeInfo;
         this.schemaInclude = schemaInclude;
         this.ignoreParseErrors = ignoreParseErrors;
+    }
+
+    private int getSchemaFieldIndex(RowType jsonRowType, String fieldName) {
+        RowType type = (RowType)jsonRowType.getFields().get(0).getType();
+        return type.getFieldNames().indexOf(fieldName);
     }
 
     @Override
@@ -143,6 +156,19 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
             GenericRowData before = (GenericRowData) payload.getField(0);
             GenericRowData after = (GenericRowData) payload.getField(1);
             String op = payload.getField(2).toString();
+
+            /* Add the added binlogSequenceNo to the data*/
+            if(binlogSequenceNoIndex > -1){
+                long binlogSequenceNo = Long.parseLong(payload.getField(3).toString());
+                before.setField(binlogSequenceNoIndex, binlogSequenceNo);
+                after.setField(binlogSequenceNoIndex, binlogSequenceNo);
+            }
+            /* Add the added binlogSequenceNo to the data*/
+            if(eventTypeIndex > -1){
+                before.setField(eventTypeIndex, StringData.fromString(op));
+                after.setField(eventTypeIndex, StringData.fromString(op));
+            }
+
             if (OP_CREATE.equals(op) || OP_READ.equals(op)) {
                 after.setRowKind(RowKind.INSERT);
                 emitRow(row, after, out);
@@ -247,7 +273,9 @@ public final class DebeziumJsonDeserializationSchema implements DeserializationS
                 DataTypes.ROW(
                         DataTypes.FIELD("before", physicalDataType),
                         DataTypes.FIELD("after", physicalDataType),
-                        DataTypes.FIELD("eventType", DataTypes.STRING()));
+                        DataTypes.FIELD("eventType", DataTypes.STRING()),
+                        DataTypes.FIELD("binlogSequenceNo", DataTypes.BIGINT())
+                        );
 
         // append fields that are required for reading metadata in the payload
         final List<DataTypes.Field> payloadMetadataFields =

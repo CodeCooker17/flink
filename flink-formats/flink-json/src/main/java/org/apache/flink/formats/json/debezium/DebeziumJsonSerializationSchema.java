@@ -29,8 +29,6 @@ import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
 
@@ -46,8 +44,8 @@ import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDa
 public class DebeziumJsonSerializationSchema implements SerializationSchema<RowData> {
     private static final long serialVersionUID = 1L;
 
-    private static final StringData OP_INSERT = StringData.fromString("c"); // insert
-    private static final StringData OP_DELETE = StringData.fromString("d"); // delete
+    private static final StringData OP_INSERT = StringData.fromString("INSERT"); // insert
+    private static final StringData OP_DELETE = StringData.fromString("DELETE"); // delete
 
     /** The serializer to serialize Debezium JSON data. * */
     private final JsonRowDataSerializationSchema jsonSerializer;
