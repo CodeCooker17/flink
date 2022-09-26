@@ -49,6 +49,7 @@ import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.LocalUnresolvedTaskManagerLocation;
 import org.apache.flink.runtime.taskmanager.TaskExecutionState;
 import org.apache.flink.runtime.util.TestingFatalErrorHandler;
+import org.apache.flink.testutils.TestingUtils;
 import org.apache.flink.util.TestLogger;
 
 import org.junit.After;
@@ -63,6 +64,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
@@ -207,8 +210,8 @@ public class JobMasterPartitionReleaseTest extends TestLogger {
         private final CompletableFuture<Collection<ResultPartitionID>> partitionsForRelease =
                 new CompletableFuture<>();
 
-        private final CompletableFuture<Collection<ResultPartitionID>>
-                partitionsForReleaseOrPromote = new CompletableFuture<>();
+        private final CompletableFuture<Collection<ResultPartitionID>> clusterPartitionsForPromote =
+                new CompletableFuture<>();
 
         private final JobMaster jobMaster;
 
@@ -234,8 +237,8 @@ public class JobMasterPartitionReleaseTest extends TestLogger {
                     taskExecutorIdForStopTracking::complete);
             partitionTracker.setStopTrackingAndReleasePartitionsConsumer(
                     partitionsForRelease::complete);
-            partitionTracker.setStopTrackingAndReleaseOrPromotePartitionsConsumer(
-                    partitionsForReleaseOrPromote::complete);
+            partitionTracker.setStopTrackingAndPromotePartitionsConsumer(
+                    clusterPartitionsForPromote::complete);
 
             Configuration configuration = new Configuration();
             configuration.setString(
@@ -249,8 +252,6 @@ public class JobMasterPartitionReleaseTest extends TestLogger {
                     new JobMasterBuilder(jobGraph, rpcService)
                             .withConfiguration(configuration)
                             .withHighAvailabilityServices(haServices)
-                            .withJobManagerSharedServices(
-                                    new TestingJobManagerSharedServicesBuilder().build())
                             .withFatalErrorHandler(fatalErrorHandler)
                             .withHeartbeatServices(heartbeatServices)
                             .withPartitionTrackerFactory(ignored -> partitionTracker)
@@ -273,9 +274,11 @@ public class JobMasterPartitionReleaseTest extends TestLogger {
 
             jobMasterGateway
                     .registerTaskManager(
-                            taskExecutorGateway.getAddress(),
-                            localTaskManagerUnresolvedLocation,
                             jobId,
+                            TaskManagerRegistrationInformation.create(
+                                    taskExecutorGateway.getAddress(),
+                                    localTaskManagerUnresolvedLocation,
+                                    TestingUtils.zeroUUID()),
                             testingTimeout)
                     .get();
 
@@ -312,13 +315,20 @@ public class JobMasterPartitionReleaseTest extends TestLogger {
         }
 
         public CompletableFuture<Collection<ResultPartitionID>> getPartitionsForReleaseOrPromote() {
-            return partitionsForReleaseOrPromote;
+            return partitionsForRelease.thenCombine(
+                    clusterPartitionsForPromote,
+                    (resultPartitionIds, resultPartitionIds2) -> {
+                        Set<ResultPartitionID> res = new HashSet<>();
+                        res.addAll(resultPartitionIds);
+                        res.addAll(resultPartitionIds2);
+                        return res;
+                    });
         }
 
         public void close() throws Exception {
             try {
                 if (jobMaster != null) {
-                    RpcUtils.terminateRpcEndpoint(jobMaster, testingTimeout);
+                    RpcUtils.terminateRpcEndpoint(jobMaster);
                 }
             } finally {
                 temporaryFolder.delete();

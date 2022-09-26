@@ -20,12 +20,15 @@ package org.apache.flink.runtime.state.filesystem;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.core.fs.DuplicatingFileSystem;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
+import org.apache.flink.runtime.state.CheckpointStateToolset;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
-import org.apache.flink.runtime.state.CheckpointStreamFactory.CheckpointStateOutputStream;
+import org.apache.flink.runtime.state.NotDuplicatingCheckpointStateToolset;
 import org.apache.flink.runtime.state.filesystem.FsCheckpointStreamFactory.FsCheckpointStateOutputStream;
 
 import javax.annotation.Nullable;
@@ -110,8 +113,14 @@ public class FsCheckpointStorageAccess extends AbstractFsCheckpointStorageAccess
 
     @Override
     public void initializeBaseLocationsForCheckpoint() throws IOException {
-        fileSystem.mkdirs(sharedStateDirectory);
-        fileSystem.mkdirs(taskOwnedStateDirectory);
+        if (!fileSystem.mkdirs(sharedStateDirectory)) {
+            throw new IOException(
+                    "Failed to create directory for shared state: " + sharedStateDirectory);
+        }
+        if (!fileSystem.mkdirs(taskOwnedStateDirectory)) {
+            throw new IOException(
+                    "Failed to create directory for task owned state: " + taskOwnedStateDirectory);
+        }
     }
 
     @Override
@@ -174,6 +183,16 @@ public class FsCheckpointStorageAccess extends AbstractFsCheckpointStorageAccess
         // so we use CheckpointedStateScope.SHARED here.
         return new FsCheckpointStateOutputStream(
                 taskOwnedStateDirectory, fileSystem, writeBufferSize, fileSizeThreshold);
+    }
+
+    @Override
+    public CheckpointStateToolset createTaskOwnedCheckpointStateToolset() {
+        if (fileSystem instanceof DuplicatingFileSystem) {
+            return new FsCheckpointStateToolset(
+                    taskOwnedStateDirectory, (DuplicatingFileSystem) fileSystem);
+        } else {
+            return new NotDuplicatingCheckpointStateToolset();
+        }
     }
 
     @Override

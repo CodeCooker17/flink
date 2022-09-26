@@ -25,6 +25,7 @@ import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
+import org.apache.flink.runtime.scheduler.SchedulingTopologyListener;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -77,6 +78,9 @@ public class TestingSchedulingTopology implements SchedulingTopology {
         }
         return resultPartition;
     }
+
+    @Override
+    public void registerSchedulingTopologyListener(SchedulingTopologyListener listener) {}
 
     @Override
     public Iterable<SchedulingPipelinedRegion> getAllPipelinedRegions() {
@@ -346,9 +350,11 @@ public class TestingSchedulingTopology implements SchedulingTopology {
 
             ConsumedPartitionGroup consumedPartitionGroup =
                     ConsumedPartitionGroup.fromMultiplePartitions(
+                            consumers.size(),
                             resultPartitions.stream()
                                     .map(TestingSchedulingResultPartition::getId)
-                                    .collect(Collectors.toList()));
+                                    .collect(Collectors.toList()),
+                            resultPartitions.get(0).getResultType());
             Map<IntermediateResultPartitionID, TestingSchedulingResultPartition>
                     consumedPartitionById =
                             resultPartitions.stream()

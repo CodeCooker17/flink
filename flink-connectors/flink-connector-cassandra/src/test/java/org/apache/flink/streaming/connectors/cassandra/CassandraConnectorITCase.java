@@ -31,12 +31,10 @@ import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.api.scala.typeutils.CaseClassTypeInfo;
 import org.apache.flink.batch.connectors.cassandra.CassandraInputFormat;
-import org.apache.flink.batch.connectors.cassandra.CassandraOutputFormat;
 import org.apache.flink.batch.connectors.cassandra.CassandraPojoInputFormat;
 import org.apache.flink.batch.connectors.cassandra.CassandraPojoOutputFormat;
 import org.apache.flink.batch.connectors.cassandra.CassandraRowOutputFormat;
 import org.apache.flink.batch.connectors.cassandra.CassandraTupleOutputFormat;
-import org.apache.flink.batch.connectors.cassandra.CustomCassandraAnnotatedPojo;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -47,7 +45,7 @@ import org.apache.flink.streaming.runtime.operators.WriteAheadSinkTestBase;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.internal.TableEnvironmentInternal;
 import org.apache.flink.testutils.junit.RetryOnException;
-import org.apache.flink.testutils.junit.RetryRule;
+import org.apache.flink.testutils.junit.extensions.retry.RetryExtension;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.DockerImageVersions;
 
@@ -56,53 +54,71 @@ import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.QueryOptions;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.SimpleStatement;
+import com.datastax.driver.core.SocketOptions;
+import com.datastax.driver.core.Statement;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.datastax.driver.mapping.Mapper;
-import org.junit.AfterClass;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.ClassRule;
-import org.junit.Rule;
-import org.junit.Test;
+import com.datastax.driver.mapping.annotations.Table;
+import net.bytebuddy.ByteBuddy;
+import org.assertj.core.api.recursive.comparison.RecursiveComparisonConfiguration;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.CassandraContainer;
+import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.images.builder.Transferable;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.io.IOException;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Constructor;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 import scala.collection.JavaConverters;
 import scala.collection.Seq;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.samePropertyValuesAs;
-import static org.junit.Assert.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT cases for all cassandra sinks. */
 @SuppressWarnings("serial")
 // NoHostAvailableException is raised by Cassandra client under load while connecting to the cluster
 @RetryOnException(times = 3, exception = NoHostAvailableException.class)
-public class CassandraConnectorITCase
+@Testcontainers
+@ExtendWith(RetryExtension.class)
+class CassandraConnectorITCase
         extends WriteAheadSinkTestBase<
                 Tuple3<String, Integer, Integer>,
                 CassandraTupleWriteAheadSink<Tuple3<String, Integer, Integer>>> {
 
-    @ClassRule
-    public static final CassandraContainer CASSANDRA_CONTAINER = createCassandraContainer();
-
     private static final int MAX_CONNECTION_RETRY = 3;
     private static final long CONNECTION_RETRY_DELAY = 500L;
-    private static final Logger LOG = LoggerFactory.getLogger(CassandraConnectorITCase.class);
 
-    @Rule public final RetryRule retryRule = new RetryRule();
+    private static final Logger LOG = LoggerFactory.getLogger(CassandraConnectorITCase.class);
+    private static final Slf4jLogConsumer LOG_CONSUMER = new Slf4jLogConsumer(LOG);
+
+    @TempDir static Path tmpDir;
+
+    private static final int READ_TIMEOUT_MILLIS = 36000;
+
+    @Container static final CassandraContainer CASSANDRA_CONTAINER = createCassandraContainer();
 
     private static final int PORT = 9042;
 
@@ -127,6 +143,13 @@ public class CassandraConnectorITCase
                                 new QueryOptions()
                                         .setConsistencyLevel(consistencyLevel)
                                         .setSerialConsistencyLevel(ConsistencyLevel.LOCAL_SERIAL))
+                        .withSocketOptions(
+                                new SocketOptions()
+                                        // default timeout x 3
+                                        .setConnectTimeoutMillis(15000)
+                                        // default timeout x3 and higher than
+                                        // request_timeout_in_ms at the cluster level
+                                        .setReadTimeoutMillis(READ_TIMEOUT_MILLIS))
                         .withoutJMXReporting()
                         .withoutMetrics()
                         .build();
@@ -136,19 +159,40 @@ public class CassandraConnectorITCase
 
     private static final String TABLE_NAME_PREFIX = "flink_";
     private static final String TABLE_NAME_VARIABLE = "$TABLE";
+    private static final String KEYSPACE = "flink";
+    private static final String TUPLE_ID_FIELD = "id";
+    private static final String TUPLE_COUNTER_FIELD = "counter";
+    private static final String TUPLE_BATCHID_FIELD = "batch_id";
     private static final String CREATE_KEYSPACE_QUERY =
-            "CREATE KEYSPACE flink WITH replication= {'class':'SimpleStrategy', 'replication_factor':1};";
-    private static final String DROP_KEYSPACE_QUERY = "DROP KEYSPACE IF EXISTS flink ;";
+            "CREATE KEYSPACE "
+                    + KEYSPACE
+                    + " WITH replication= {'class':'SimpleStrategy', 'replication_factor':1};";
     private static final String CREATE_TABLE_QUERY =
-            "CREATE TABLE flink."
+            "CREATE TABLE "
+                    + KEYSPACE
+                    + "."
                     + TABLE_NAME_VARIABLE
-                    + " (id text PRIMARY KEY, counter int, batch_id int);";
+                    + " ("
+                    + TUPLE_ID_FIELD
+                    + " text PRIMARY KEY, "
+                    + TUPLE_COUNTER_FIELD
+                    + " int, "
+                    + TUPLE_BATCHID_FIELD
+                    + " int);";
     private static final String INSERT_DATA_QUERY =
-            "INSERT INTO flink."
+            "INSERT INTO "
+                    + KEYSPACE
+                    + "."
                     + TABLE_NAME_VARIABLE
-                    + " (id, counter, batch_id) VALUES (?, ?, ?)";
+                    + " ("
+                    + TUPLE_ID_FIELD
+                    + ", "
+                    + TUPLE_COUNTER_FIELD
+                    + ", "
+                    + TUPLE_BATCHID_FIELD
+                    + ") VALUES (?, ?, ?)";
     private static final String SELECT_DATA_QUERY =
-            "SELECT * FROM flink." + TABLE_NAME_VARIABLE + ';';
+            "SELECT * FROM " + KEYSPACE + "." + TABLE_NAME_VARIABLE + ';';
 
     private static final Random random = new Random();
     private int tableID;
@@ -168,14 +212,153 @@ public class CassandraConnectorITCase
         }
     }
 
+    private static Class<? extends Pojo> annotatePojoWithTable(String keyspace, String tableName) {
+        return new ByteBuddy()
+                .redefine(Pojo.class)
+                .name("org.apache.flink.streaming.connectors.cassandra.Pojo" + tableName)
+                .annotateType(createTableAnnotation(keyspace, tableName))
+                .make()
+                .load(Pojo.class.getClassLoader())
+                .getLoaded();
+    }
+
+    @NotNull
+    private static Table createTableAnnotation(String keyspace, String tableName) {
+        return new Table() {
+
+            @Override
+            public String keyspace() {
+                return keyspace;
+            }
+
+            @Override
+            public String name() {
+                return tableName;
+            }
+
+            @Override
+            public boolean caseSensitiveKeyspace() {
+                return false;
+            }
+
+            @Override
+            public boolean caseSensitiveTable() {
+                return false;
+            }
+
+            @Override
+            public String writeConsistency() {
+                return "";
+            }
+
+            @Override
+            public String readConsistency() {
+                return "";
+            }
+
+            @Override
+            public Class<? extends Annotation> annotationType() {
+                return Table.class;
+            }
+        };
+    }
+
+    // ------------------------------------------------------------------------
+    //  Utility methods
+    // ------------------------------------------------------------------------
+
     public static CassandraContainer createCassandraContainer() {
-        CassandraContainer cassandra = new CassandraContainer(DockerImageVersions.CASSANDRA_3);
+        CassandraContainer cassandra = new CassandraContainer(DockerImageVersions.CASSANDRA_4_0);
         cassandra.withJmxReporting(false);
+        cassandra.withLogConsumer(LOG_CONSUMER);
         return cassandra;
     }
 
-    @BeforeClass
-    public static void startAndInitializeCassandra() {
+    private static void raiseCassandraRequestsTimeouts() {
+        try {
+            final Path configurationPath = Files.createTempFile(tmpDir.toAbsolutePath(), "", "");
+            CASSANDRA_CONTAINER.copyFileFromContainer(
+                    "/etc/cassandra/cassandra.yaml", configurationPath.toAbsolutePath().toString());
+            String configuration =
+                    new String(Files.readAllBytes(configurationPath), StandardCharsets.UTF_8);
+            String patchedConfiguration =
+                    configuration
+                            .replaceAll(
+                                    "request_timeout_in_ms: [0-9]+",
+                                    "request_timeout_in_ms: 30000") // x3 default timeout
+                            .replaceAll(
+                                    "read_request_timeout_in_ms: [0-9]+",
+                                    "read_request_timeout_in_ms: 15000") // x3 default timeout
+                            .replaceAll(
+                                    "write_request_timeout_in_ms: [0-9]+",
+                                    "write_request_timeout_in_ms: 6000"); // x3 default timeout
+            CASSANDRA_CONTAINER.copyFileToContainer(
+                    Transferable.of(patchedConfiguration.getBytes(StandardCharsets.UTF_8)),
+                    "/etc/cassandra/cassandra.yaml");
+        } catch (IOException e) {
+            throw new RuntimeException("Unable to open Cassandra configuration file ", e);
+        }
+    }
+
+    private <T> List<T> readPojosWithInputFormat(Class<T> annotatedPojoClass) {
+        final CassandraPojoInputFormat<T> source =
+                new CassandraPojoInputFormat<>(
+                        injectTableName(SELECT_DATA_QUERY), builderForReading, annotatedPojoClass);
+        List<T> result = new ArrayList<>();
+
+        try {
+            source.configure(new Configuration());
+            source.open(null);
+            while (!source.reachedEnd()) {
+                T temp = source.nextRecord(null);
+                result.add(temp);
+            }
+        } finally {
+            source.close();
+        }
+        return result;
+    }
+
+    private <T> List<T> writePojosWithOutputFormat(Class<T> annotatedPojoClass) throws Exception {
+        final CassandraPojoOutputFormat<T> sink =
+                new CassandraPojoOutputFormat<>(
+                        builderForWriting,
+                        annotatedPojoClass,
+                        () -> new Mapper.Option[] {Mapper.Option.saveNullFields(true)});
+
+        final Constructor<T> pojoConstructor = getPojoConstructor(annotatedPojoClass);
+        List<T> pojos = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            pojos.add(pojoConstructor.newInstance(UUID.randomUUID().toString(), i, 0));
+        }
+        try {
+            sink.configure(new Configuration());
+            sink.open(0, 1);
+            for (T pojo : pojos) {
+                sink.writeRecord(pojo);
+            }
+        } finally {
+            sink.close();
+        }
+        return pojos;
+    }
+
+    private <T> Constructor<T> getPojoConstructor(Class<T> annotatedPojoClass)
+            throws NoSuchMethodException {
+        return annotatedPojoClass.getConstructor(String.class, Integer.TYPE, Integer.TYPE);
+    }
+
+    private String injectTableName(String target) {
+        return target.replace(TABLE_NAME_VARIABLE, TABLE_NAME_PREFIX + tableID);
+    }
+
+    // ------------------------------------------------------------------------
+    //  Tests initialization
+    // ------------------------------------------------------------------------
+
+    @BeforeAll
+    static void startAndInitializeCassandra() {
+        raiseCassandraRequestsTimeouts();
         // CASSANDRA_CONTAINER#start() already contains retrials
         CASSANDRA_CONTAINER.start();
         cluster = CASSANDRA_CONTAINER.getCluster();
@@ -203,20 +386,17 @@ public class CassandraConnectorITCase
                 }
             }
         }
-        session.execute(DROP_KEYSPACE_QUERY);
-        session.execute(CREATE_KEYSPACE_QUERY);
-        session.execute(
-                CREATE_TABLE_QUERY.replace(TABLE_NAME_VARIABLE, TABLE_NAME_PREFIX + "initial"));
+        session.execute(requestWithTimeout(CREATE_KEYSPACE_QUERY));
     }
 
-    @Before
-    public void createTable() {
+    @BeforeEach
+    void createTable() {
         tableID = random.nextInt(Integer.MAX_VALUE);
-        session.execute(injectTableName(CREATE_TABLE_QUERY));
+        session.execute(requestWithTimeout(injectTableName(CREATE_TABLE_QUERY)));
     }
 
-    @AfterClass
-    public static void closeCassandra() {
+    @AfterAll
+    static void closeCassandra() {
         if (session != null) {
             session.close();
         }
@@ -224,6 +404,35 @@ public class CassandraConnectorITCase
             cluster.close();
         }
         CASSANDRA_CONTAINER.stop();
+    }
+
+    // ------------------------------------------------------------------------
+    //  Technical Tests
+    // ------------------------------------------------------------------------
+
+    @TestTemplate
+    void testAnnotatePojoWithTable() {
+        final String tableName = TABLE_NAME_PREFIX + tableID;
+
+        final Class<? extends Pojo> annotatedPojoClass = annotatePojoWithTable(KEYSPACE, tableName);
+        final Table pojoTableAnnotation = annotatedPojoClass.getAnnotation(Table.class);
+        assertThat(pojoTableAnnotation.name()).contains(tableName);
+    }
+
+    @TestTemplate
+    void testRaiseCassandraRequestsTimeouts() throws IOException {
+        // raiseCassandraRequestsTimeouts() was already called in @BeforeClass,
+        // do not change the container conf twice, just assert that it was indeed changed in the
+        // container
+        final Path configurationPath = Files.createTempFile(tmpDir.toAbsolutePath(), "", "");
+        CASSANDRA_CONTAINER.copyFileFromContainer(
+                "/etc/cassandra/cassandra.yaml", configurationPath.toAbsolutePath().toString());
+        final String configuration =
+                new String(Files.readAllBytes(configurationPath), StandardCharsets.UTF_8);
+        assertThat(configuration)
+                .contains("request_timeout_in_ms: 30000")
+                .contains("read_request_timeout_in_ms: 15000")
+                .contains("write_request_timeout_in_ms: 6000");
     }
 
     // ------------------------------------------------------------------------
@@ -255,43 +464,43 @@ public class CassandraConnectorITCase
     protected void verifyResultsIdealCircumstances(
             CassandraTupleWriteAheadSink<Tuple3<String, Integer, Integer>> sink) {
 
-        ResultSet result = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet result = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         ArrayList<Integer> list = new ArrayList<>();
         for (int x = 1; x <= 60; x++) {
             list.add(x);
         }
 
         for (com.datastax.driver.core.Row s : result) {
-            list.remove(new Integer(s.getInt("counter")));
+            list.remove(new Integer(s.getInt(TUPLE_COUNTER_FIELD)));
         }
-        Assert.assertTrue(
-                "The following ID's were not found in the ResultSet: " + list.toString(),
-                list.isEmpty());
+        assertThat(list)
+                .as("The following ID's were not found in the ResultSet: " + list)
+                .isEmpty();
     }
 
     @Override
     protected void verifyResultsDataPersistenceUponMissedNotify(
             CassandraTupleWriteAheadSink<Tuple3<String, Integer, Integer>> sink) {
 
-        ResultSet result = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet result = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         ArrayList<Integer> list = new ArrayList<>();
         for (int x = 1; x <= 60; x++) {
             list.add(x);
         }
 
         for (com.datastax.driver.core.Row s : result) {
-            list.remove(new Integer(s.getInt("counter")));
+            list.remove(new Integer(s.getInt(TUPLE_COUNTER_FIELD)));
         }
-        Assert.assertTrue(
-                "The following ID's were not found in the ResultSet: " + list.toString(),
-                list.isEmpty());
+        assertThat(list)
+                .as("The following ID's were not found in the ResultSet: " + list)
+                .isEmpty();
     }
 
     @Override
     protected void verifyResultsDataDiscardingUponRestore(
             CassandraTupleWriteAheadSink<Tuple3<String, Integer, Integer>> sink) {
 
-        ResultSet result = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet result = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         ArrayList<Integer> list = new ArrayList<>();
         for (int x = 1; x <= 20; x++) {
             list.add(x);
@@ -301,11 +510,11 @@ public class CassandraConnectorITCase
         }
 
         for (com.datastax.driver.core.Row s : result) {
-            list.remove(new Integer(s.getInt("counter")));
+            list.remove(new Integer(s.getInt(TUPLE_COUNTER_FIELD)));
         }
-        Assert.assertTrue(
-                "The following ID's were not found in the ResultSet: " + list.toString(),
-                list.isEmpty());
+        assertThat(list)
+                .as("The following ID's were not found in the ResultSet: " + list)
+                .isEmpty();
     }
 
     @Override
@@ -325,18 +534,18 @@ public class CassandraConnectorITCase
         }
 
         ArrayList<Integer> actual = new ArrayList<>();
-        ResultSet result = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet result = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
 
         for (com.datastax.driver.core.Row s : result) {
-            actual.add(s.getInt("counter"));
+            actual.add(s.getInt(TUPLE_COUNTER_FIELD));
         }
 
         Collections.sort(actual);
-        Assert.assertArrayEquals(expected.toArray(), actual.toArray());
+        assertThat(actual.toArray()).isEqualTo(expected.toArray());
     }
 
-    @Test
-    public void testCassandraCommitter() throws Exception {
+    @TestTemplate
+    void testCassandraCommitter() throws Exception {
         String jobID = new JobID().toString();
         CassandraCommitter cc1 = new CassandraCommitter(builderForReading, "flink_auxiliary_cc");
         cc1.setJobId(jobID);
@@ -356,18 +565,18 @@ public class CassandraConnectorITCase
         cc2.open();
         cc3.open();
 
-        Assert.assertFalse(cc1.isCheckpointCommitted(0, 1));
-        Assert.assertFalse(cc2.isCheckpointCommitted(1, 1));
-        Assert.assertFalse(cc3.isCheckpointCommitted(0, 1));
+        assertThat(cc1.isCheckpointCommitted(0, 1)).isFalse();
+        assertThat(cc2.isCheckpointCommitted(1, 1)).isFalse();
+        assertThat(cc3.isCheckpointCommitted(0, 1)).isFalse();
 
         cc1.commitCheckpoint(0, 1);
-        Assert.assertTrue(cc1.isCheckpointCommitted(0, 1));
+        assertThat(cc1.isCheckpointCommitted(0, 1)).isTrue();
         // verify that other sub-tasks aren't affected
-        Assert.assertFalse(cc2.isCheckpointCommitted(1, 1));
+        assertThat(cc2.isCheckpointCommitted(1, 1)).isFalse();
         // verify that other tasks aren't affected
-        Assert.assertFalse(cc3.isCheckpointCommitted(0, 1));
+        assertThat(cc3.isCheckpointCommitted(0, 1)).isFalse();
 
-        Assert.assertFalse(cc1.isCheckpointCommitted(0, 2));
+        assertThat(cc1.isCheckpointCommitted(0, 2)).isFalse();
 
         cc1.close();
         cc2.close();
@@ -381,8 +590,8 @@ public class CassandraConnectorITCase
 
         // verify that checkpoint data is not destroyed within open/close and not reliant on
         // internally cached data
-        Assert.assertTrue(cc1.isCheckpointCommitted(0, 1));
-        Assert.assertFalse(cc1.isCheckpointCommitted(0, 2));
+        assertThat(cc1.isCheckpointCommitted(0, 1)).isTrue();
+        assertThat(cc1.isCheckpointCommitted(0, 2)).isFalse();
 
         cc1.close();
     }
@@ -391,8 +600,8 @@ public class CassandraConnectorITCase
     //  At-least-once Tests
     // ------------------------------------------------------------------------
 
-    @Test
-    public void testCassandraTupleAtLeastOnceSink() throws Exception {
+    @TestTemplate
+    void testCassandraTupleAtLeastOnceSink() throws Exception {
         CassandraTupleSink<Tuple3<String, Integer, Integer>> sink =
                 new CassandraTupleSink<>(injectTableName(INSERT_DATA_QUERY), builderForWriting);
         try {
@@ -404,12 +613,12 @@ public class CassandraConnectorITCase
             sink.close();
         }
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
-        Assert.assertEquals(20, rs.all().size());
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
+        assertThat(rs.all()).hasSize(20);
     }
 
-    @Test
-    public void testCassandraRowAtLeastOnceSink() throws Exception {
+    @TestTemplate
+    void testCassandraRowAtLeastOnceSink() throws Exception {
         CassandraRowSink sink =
                 new CassandraRowSink(
                         FIELD_TYPES.length, injectTableName(INSERT_DATA_QUERY), builderForWriting);
@@ -422,53 +631,46 @@ public class CassandraConnectorITCase
             sink.close();
         }
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
-        Assert.assertEquals(20, rs.all().size());
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
+        assertThat(rs.all()).hasSize(20);
     }
 
-    @Test
-    public void testCassandraPojoAtLeastOnceSink() throws Exception {
-        session.execute(CREATE_TABLE_QUERY.replace(TABLE_NAME_VARIABLE, "test"));
+    @TestTemplate
+    void testCassandraPojoAtLeastOnceSink() throws Exception {
+        final Class<? extends Pojo> annotatedPojoClass =
+                annotatePojoWithTable(KEYSPACE, TABLE_NAME_PREFIX + tableID);
+        writePojos(annotatedPojoClass, null);
 
-        CassandraPojoSink<Pojo> sink = new CassandraPojoSink<>(Pojo.class, builderForWriting);
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
+        assertThat(rs.all()).hasSize(20);
+    }
+
+    @TestTemplate
+    void testCassandraPojoNoAnnotatedKeyspaceAtLeastOnceSink() throws Exception {
+        final Class<? extends Pojo> annotatedPojoClass =
+                annotatePojoWithTable("", TABLE_NAME_PREFIX + tableID);
+        writePojos(annotatedPojoClass, KEYSPACE);
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
+        assertThat(rs.all()).hasSize(20);
+    }
+
+    private <T> void writePojos(Class<T> annotatedPojoClass, @Nullable String keyspace)
+            throws Exception {
+        final Constructor<T> pojoConstructor = getPojoConstructor(annotatedPojoClass);
+        CassandraPojoSink<T> sink =
+                new CassandraPojoSink<>(annotatedPojoClass, builderForWriting, null, keyspace);
         try {
             sink.open(new Configuration());
             for (int x = 0; x < 20; x++) {
-                sink.send(new Pojo(UUID.randomUUID().toString(), x, 0));
+                sink.send(pojoConstructor.newInstance(UUID.randomUUID().toString(), x, 0));
             }
         } finally {
             sink.close();
         }
-
-        ResultSet rs = session.execute(SELECT_DATA_QUERY.replace(TABLE_NAME_VARIABLE, "test"));
-        Assert.assertEquals(20, rs.all().size());
     }
 
-    @Test
-    public void testCassandraPojoNoAnnotatedKeyspaceAtLeastOnceSink() throws Exception {
-        session.execute(
-                CREATE_TABLE_QUERY.replace(TABLE_NAME_VARIABLE, "testPojoNoAnnotatedKeyspace"));
-
-        CassandraPojoSink<PojoNoAnnotatedKeyspace> sink =
-                new CassandraPojoSink<>(PojoNoAnnotatedKeyspace.class, builderForWriting, "flink");
-        try {
-            sink.open(new Configuration());
-            for (int x = 0; x < 20; x++) {
-                sink.send(new PojoNoAnnotatedKeyspace(UUID.randomUUID().toString(), x, 0));
-            }
-
-        } finally {
-            sink.close();
-        }
-        ResultSet rs =
-                session.execute(
-                        SELECT_DATA_QUERY.replace(
-                                TABLE_NAME_VARIABLE, "testPojoNoAnnotatedKeyspace"));
-        Assert.assertEquals(20, rs.all().size());
-    }
-
-    @Test
-    public void testCassandraTableSink() throws Exception {
+    @TestTemplate
+    void testCassandraTableSink() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(4);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
@@ -489,7 +691,7 @@ public class CassandraConnectorITCase
 
         tEnv.sqlQuery("select * from testFlinkTable").executeInsert("cassandraTable").await();
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
 
         // validate that all input was correctly written to Cassandra
         List<Row> input = new ArrayList<>(rowCollection);
@@ -499,80 +701,49 @@ public class CassandraConnectorITCase
             cmp.setField(0, o.getString(0));
             cmp.setField(1, o.getInt(2));
             cmp.setField(2, o.getInt(1));
-            Assert.assertTrue(
-                    "Row " + cmp + " was written to Cassandra but not in input.",
-                    input.remove(cmp));
+            assertThat(input.remove(cmp))
+                    .as("Row " + cmp + " was written to Cassandra but not in input.")
+                    .isTrue();
         }
-        Assert.assertTrue(
-                "The input data was not completely written to Cassandra", input.isEmpty());
+        assertThat(input).as("The input data was not completely written to Cassandra").isEmpty();
     }
 
-    @Test
-    public void testCassandraBatchPojoFormat() throws Exception {
+    private static int retrialsCount = 0;
 
-        session.execute(
-                CREATE_TABLE_QUERY.replace(
-                        TABLE_NAME_VARIABLE, CustomCassandraAnnotatedPojo.TABLE_NAME));
-
-        OutputFormat<CustomCassandraAnnotatedPojo> sink =
-                new CassandraPojoOutputFormat<>(
-                        builderForWriting,
-                        CustomCassandraAnnotatedPojo.class,
-                        () -> new Mapper.Option[] {Mapper.Option.saveNullFields(true)});
-
-        List<CustomCassandraAnnotatedPojo> customCassandraAnnotatedPojos =
-                IntStream.range(0, 20)
-                        .mapToObj(
-                                x ->
-                                        new CustomCassandraAnnotatedPojo(
-                                                UUID.randomUUID().toString(), x, 0))
-                        .collect(Collectors.toList());
-        try {
-            sink.configure(new Configuration());
-            sink.open(0, 1);
-            for (CustomCassandraAnnotatedPojo customCassandraAnnotatedPojo :
-                    customCassandraAnnotatedPojos) {
-                sink.writeRecord(customCassandraAnnotatedPojo);
-            }
-        } finally {
-            sink.close();
+    @TestTemplate
+    void testRetrial() {
+        annotatePojoWithTable(KEYSPACE, TABLE_NAME_PREFIX + tableID);
+        if (retrialsCount < 2) {
+            retrialsCount++;
+            throw new NoHostAvailableException(new HashMap<>());
         }
-        ResultSet rs =
-                session.execute(
-                        SELECT_DATA_QUERY.replace(
-                                TABLE_NAME_VARIABLE, CustomCassandraAnnotatedPojo.TABLE_NAME));
-        Assert.assertEquals(20, rs.all().size());
-
-        InputFormat<CustomCassandraAnnotatedPojo, InputSplit> source =
-                new CassandraPojoInputFormat<>(
-                        SELECT_DATA_QUERY.replace(TABLE_NAME_VARIABLE, "batches"),
-                        builderForReading,
-                        CustomCassandraAnnotatedPojo.class);
-        List<CustomCassandraAnnotatedPojo> result = new ArrayList<>();
-
-        try {
-            source.configure(new Configuration());
-            source.open(null);
-            while (!source.reachedEnd()) {
-                CustomCassandraAnnotatedPojo temp = source.nextRecord(null);
-                result.add(temp);
-            }
-        } finally {
-            source.close();
-        }
-
-        Assert.assertEquals(20, result.size());
-        result.sort(Comparator.comparingInt(CustomCassandraAnnotatedPojo::getCounter));
-        customCassandraAnnotatedPojos.sort(
-                Comparator.comparingInt(CustomCassandraAnnotatedPojo::getCounter));
-
-        assertThat(result, samePropertyValuesAs(customCassandraAnnotatedPojos));
     }
 
-    @Test
-    public void testCassandraBatchTupleFormat() throws Exception {
+    @TestTemplate
+    void testCassandraBatchPojoFormat() throws Exception {
+
+        final Class<? extends Pojo> annotatedPojoClass =
+                annotatePojoWithTable(KEYSPACE, TABLE_NAME_PREFIX + tableID);
+
+        final List<? extends Pojo> pojos = writePojosWithOutputFormat(annotatedPojoClass);
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
+        assertThat(rs.all()).hasSize(20);
+
+        final List<? extends Pojo> result = readPojosWithInputFormat(annotatedPojoClass);
+        assertThat(result)
+                .hasSize(20)
+                .usingRecursiveComparison(
+                        RecursiveComparisonConfiguration.builder()
+                                .withIgnoreCollectionOrder(true)
+                                .build())
+                .isEqualTo(pojos);
+    }
+
+    @TestTemplate
+    void testCassandraBatchTupleFormat() throws Exception {
         OutputFormat<Tuple3<String, Integer, Integer>> sink =
-                new CassandraOutputFormat<>(injectTableName(INSERT_DATA_QUERY), builderForWriting);
+                new CassandraTupleOutputFormat<>(
+                        injectTableName(INSERT_DATA_QUERY), builderForWriting);
         try {
             sink.configure(new Configuration());
             sink.open(0, 1);
@@ -609,11 +780,11 @@ public class CassandraConnectorITCase
             source.close();
         }
 
-        Assert.assertEquals(20, result.size());
+        assertThat(result).hasSize(20);
     }
 
-    @Test
-    public void testCassandraBatchRowFormat() throws Exception {
+    @TestTemplate
+    void testCassandraBatchRowFormat() throws Exception {
         OutputFormat<Row> sink =
                 new CassandraRowOutputFormat(injectTableName(INSERT_DATA_QUERY), builderForWriting);
         try {
@@ -627,17 +798,13 @@ public class CassandraConnectorITCase
             sink.close();
         }
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         List<com.datastax.driver.core.Row> rows = rs.all();
-        Assert.assertEquals(rowCollection.size(), rows.size());
+        assertThat(rows).hasSameSizeAs(rowCollection);
     }
 
-    private String injectTableName(String target) {
-        return target.replace(TABLE_NAME_VARIABLE, TABLE_NAME_PREFIX + tableID);
-    }
-
-    @Test
-    public void testCassandraScalaTupleAtLeastOnceSinkBuilderDetection() throws Exception {
+    @TestTemplate
+    void testCassandraScalaTupleAtLeastOnceSinkBuilderDetection() throws Exception {
         Class<scala.Tuple1<String>> c =
                 (Class<scala.Tuple1<String>>) new scala.Tuple1<>("hello").getClass();
         Seq<TypeInformation<?>> typeInfos =
@@ -663,11 +830,11 @@ public class CassandraConnectorITCase
 
         CassandraSink.CassandraSinkBuilder<scala.Tuple1<String>> sinkBuilder =
                 CassandraSink.addSink(input);
-        assertTrue(sinkBuilder instanceof CassandraSink.CassandraScalaProductSinkBuilder);
+        assertThat(sinkBuilder).isInstanceOf(CassandraSink.CassandraScalaProductSinkBuilder.class);
     }
 
-    @Test
-    public void testCassandraScalaTupleAtLeastSink() throws Exception {
+    @TestTemplate
+    void testCassandraScalaTupleAtLeastSink() throws Exception {
         CassandraScalaProductSink<scala.Tuple3<String, Integer, Integer>> sink =
                 new CassandraScalaProductSink<>(
                         injectTableName(INSERT_DATA_QUERY), builderForWriting);
@@ -685,20 +852,22 @@ public class CassandraConnectorITCase
             sink.close();
         }
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         List<com.datastax.driver.core.Row> rows = rs.all();
-        Assert.assertEquals(scalaTupleCollection.size(), rows.size());
+        assertThat(rows).hasSameSizeAs(scalaTupleCollection);
 
         for (com.datastax.driver.core.Row row : rows) {
             scalaTupleCollection.remove(
                     new scala.Tuple3<>(
-                            row.getString("id"), row.getInt("counter"), row.getInt("batch_id")));
+                            row.getString(TUPLE_ID_FIELD),
+                            row.getInt(TUPLE_COUNTER_FIELD),
+                            row.getInt(TUPLE_BATCHID_FIELD)));
         }
-        Assert.assertEquals(0, scalaTupleCollection.size());
+        assertThat(scalaTupleCollection).isEmpty();
     }
 
-    @Test
-    public void testCassandraScalaTuplePartialColumnUpdate() throws Exception {
+    @TestTemplate
+    void testCassandraScalaTuplePartialColumnUpdate() throws Exception {
         CassandraSinkBaseConfig config =
                 CassandraSinkBaseConfig.newBuilder().setIgnoreNullFields(true).build();
         CassandraScalaProductSink<scala.Tuple3<String, Integer, Integer>> sink =
@@ -723,15 +892,21 @@ public class CassandraConnectorITCase
             sink.close();
         }
 
-        ResultSet rs = session.execute(injectTableName(SELECT_DATA_QUERY));
+        ResultSet rs = session.execute(requestWithTimeout(injectTableName(SELECT_DATA_QUERY)));
         List<com.datastax.driver.core.Row> rows = rs.all();
-        Assert.assertEquals(1, rows.size());
+        assertThat(rows).hasSize(1);
         // Since nulls are ignored, we should be reading one complete record
         for (com.datastax.driver.core.Row row : rows) {
-            Assert.assertEquals(
-                    new scala.Tuple3<>(id, counter, batchId),
-                    new scala.Tuple3<>(
-                            row.getString("id"), row.getInt("counter"), row.getInt("batch_id")));
+            assertThat(
+                            new scala.Tuple3<>(
+                                    row.getString(TUPLE_ID_FIELD),
+                                    row.getInt(TUPLE_COUNTER_FIELD),
+                                    row.getInt(TUPLE_BATCHID_FIELD)))
+                    .isEqualTo(new scala.Tuple3<>(id, counter, batchId));
         }
+    }
+
+    private static Statement requestWithTimeout(String query) {
+        return new SimpleStatement(query).setReadTimeoutMillis(READ_TIMEOUT_MILLIS);
     }
 }

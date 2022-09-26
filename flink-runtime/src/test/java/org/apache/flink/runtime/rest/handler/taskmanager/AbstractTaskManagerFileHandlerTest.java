@@ -20,7 +20,6 @@ package org.apache.flink.runtime.rest.handler.taskmanager;
 
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.configuration.BlobServerOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.blob.TransientBlobKey;
@@ -37,6 +36,7 @@ import org.apache.flink.runtime.rest.messages.UntypedResponseMessageHeaders;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerFileMessageParameters;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerIdPathParameter;
 import org.apache.flink.runtime.rest.messages.taskmanager.TaskManagerMessageParameters;
+import org.apache.flink.runtime.rest.versioning.RuntimeRestAPIVersion;
 import org.apache.flink.runtime.webmonitor.RestfulGateway;
 import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
 import org.apache.flink.testutils.TestingUtils;
@@ -80,6 +80,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.SocketAddress;
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Queue;
@@ -118,10 +119,9 @@ public class AbstractTaskManagerFileHandlerTest extends TestLogger {
     @BeforeClass
     public static void setup() throws IOException, HandlerRequestException {
         final Configuration configuration = new Configuration();
-        configuration.setString(
-                BlobServerOptions.STORAGE_DIRECTORY, temporaryFolder.newFolder().getAbsolutePath());
 
-        blobServer = new BlobServer(configuration, new VoidBlobStore());
+        blobServer =
+                new BlobServer(configuration, temporaryFolder.newFolder(), new VoidBlobStore());
 
         handlerRequest =
                 HandlerRequest.resolveParametersAndCreate(
@@ -568,6 +568,11 @@ public class AbstractTaskManagerFileHandlerTest extends TestLogger {
         @Override
         public String getTargetRestEndpointURL() {
             return URL;
+        }
+
+        @Override
+        public Collection<RuntimeRestAPIVersion> getSupportedAPIVersions() {
+            return Collections.singleton(RuntimeRestAPIVersion.V1);
         }
     }
 }

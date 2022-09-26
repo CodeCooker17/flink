@@ -26,6 +26,7 @@ import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.DescribedEnum;
 import org.apache.flink.configuration.ExecutionOptions;
+import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.MetricOptions;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.ReadableConfig;
@@ -71,6 +72,15 @@ import static org.apache.flink.util.Preconditions.checkArgument;
  */
 @Public
 public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecutionConfig> {
+
+    // NOTE TO IMPLEMENTERS:
+    // Please do not add further fields to this class. Use the ConfigOption stack instead!
+    // It is currently very tricky to keep this kind of POJO classes in sync with instances of
+    // org.apache.flink.configuration.Configuration. Instances of Configuration are way easier to
+    // pass, layer, merge, restrict, copy, filter, etc.
+    // See ExecutionOptions.RUNTIME_MODE for a reference implementation. If the option is very
+    // crucial for the API, we can add a dedicated setter to StreamExecutionEnvironment. Otherwise,
+    // introducing a ConfigOption should be enough.
 
     private static final long serialVersionUID = 1L;
 
@@ -152,6 +162,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 
     private RestartStrategies.RestartStrategyConfiguration restartStrategyConfiguration =
             new RestartStrategies.FallbackRestartStrategyConfiguration();
+
+    private boolean isDynamicGraph = false;
 
     private long taskCancellationIntervalMillis = -1;
 
@@ -469,6 +481,16 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
         } else {
             return restartStrategyConfiguration;
         }
+    }
+
+    @Internal
+    public void setDynamicGraph(boolean dynamicGraph) {
+        isDynamicGraph = dynamicGraph;
+    }
+
+    @Internal
+    public boolean isDynamicGraph() {
+        return isDynamicGraph;
     }
 
     /**
@@ -937,7 +959,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
                     && registeredKryoTypes.equals(other.registeredKryoTypes)
                     && registeredPojoTypes.equals(other.registeredPojoTypes)
                     && taskCancellationIntervalMillis == other.taskCancellationIntervalMillis
-                    && useSnapshotCompression == other.useSnapshotCompression;
+                    && useSnapshotCompression == other.useSnapshotCompression
+                    && isDynamicGraph == other.isDynamicGraph;
 
         } else {
             return false;
@@ -963,7 +986,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
                 registeredKryoTypes,
                 registeredPojoTypes,
                 taskCancellationIntervalMillis,
-                useSnapshotCompression);
+                useSnapshotCompression,
+                isDynamicGraph);
     }
 
     @Override
@@ -1021,6 +1045,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
                 + registeredKryoTypes
                 + ", registeredPojoTypes="
                 + registeredPojoTypes
+                + ", isDynamicGraph="
+                + isDynamicGraph
                 + '}';
     }
 
@@ -1180,6 +1206,14 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
                 .getOptional(PipelineOptions.KRYO_REGISTERED_CLASSES)
                 .map(c -> loadClasses(c, classLoader, "Could not load kryo type to be registered."))
                 .ifPresent(c -> this.registeredKryoTypes = c);
+
+        configuration
+                .getOptional(JobManagerOptions.SCHEDULER)
+                .ifPresent(
+                        schedulerType ->
+                                this.setDynamicGraph(
+                                        schedulerType
+                                                == JobManagerOptions.SchedulerType.AdaptiveBatch));
     }
 
     private LinkedHashSet<Class<?>> loadClasses(

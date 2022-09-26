@@ -26,8 +26,6 @@ import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.runtime.JobException;
 import org.apache.flink.runtime.accumulators.StringifiedAccumulatorResult;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
-import org.apache.flink.runtime.checkpoint.CheckpointType;
-import org.apache.flink.runtime.checkpoint.CheckpointType.PostCheckpointAction;
 import org.apache.flink.runtime.checkpoint.JobManagerTaskRestore;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
@@ -67,6 +65,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -135,7 +134,11 @@ public class Execution
      */
     private final long[] stateTimestamps;
 
-    private final int attemptNumber;
+    /**
+     * The end timestamps when state transitions occurred, indexed by {@link
+     * ExecutionState#ordinal()}.
+     */
+    private final long[] stateEndTimestamps;
 
     private final Time rpcTimeout;
 
@@ -207,12 +210,15 @@ public class Execution
 
         this.executor = checkNotNull(executor);
         this.vertex = checkNotNull(vertex);
-        this.attemptId = new ExecutionAttemptID();
+        this.attemptId =
+                new ExecutionAttemptID(
+                        vertex.getExecutionGraphAccessor().getExecutionGraphID(),
+                        vertex.getID(),
+                        attemptNumber);
         this.rpcTimeout = checkNotNull(rpcTimeout);
 
-        this.attemptNumber = attemptNumber;
-
         this.stateTimestamps = new long[ExecutionState.values().length];
+        this.stateEndTimestamps = new long[ExecutionState.values().length];
         markTimestamp(CREATED, startTimestamp);
 
         this.partitionInfos = new ArrayList<>(16);
@@ -240,7 +246,7 @@ public class Execution
 
     @Override
     public int getAttemptNumber() {
-        return attemptNumber;
+        return attemptId.getAttemptNumber();
     }
 
     @Override
@@ -290,6 +296,10 @@ public class Execution
                             && !taskManagerLocationFuture.isDone()) {
                         taskManagerLocationFuture.complete(logicalSlot.getTaskManagerLocation());
                         assignedAllocationID = logicalSlot.getAllocationId();
+                        getVertex()
+                                .setLatestPriorSlotAllocation(
+                                        assignedResource.getTaskManagerLocation(),
+                                        logicalSlot.getAllocationId());
                         return true;
                     } else {
                         // free assigned resource and return false
@@ -310,10 +320,10 @@ public class Execution
         }
     }
 
-    public InputSplit getNextInputSplit() {
+    public Optional<InputSplit> getNextInputSplit() {
         final LogicalSlot slot = this.getAssignedResource();
         final String host = slot != null ? slot.getTaskManagerLocation().getHostname() : null;
-        return this.vertex.getNextInputSplit(host);
+        return this.vertex.getNextInputSplit(host, getAttemptNumber());
     }
 
     @Override
@@ -336,8 +346,18 @@ public class Execution
     }
 
     @Override
+    public long[] getStateEndTimestamps() {
+        return stateEndTimestamps;
+    }
+
+    @Override
     public long getStateTimestamp(ExecutionState state) {
         return this.stateTimestamps[state.ordinal()];
+    }
+
+    @Override
+    public long getStateEndTimestamp(ExecutionState state) {
+        return this.stateEndTimestamps[state.ordinal()];
     }
 
     public boolean isFinished() {
@@ -403,14 +423,12 @@ public class Execution
     //  Actions
     // --------------------------------------------------------------------------------------------
 
-    public CompletableFuture<Void> registerProducedPartitions(
-            TaskManagerLocation location, boolean notifyPartitionDataAvailable) {
+    public CompletableFuture<Void> registerProducedPartitions(TaskManagerLocation location) {
 
         assertRunningInJobMasterMainThread();
 
         return FutureUtils.thenApplyAsyncIfNotDone(
-                registerProducedPartitions(
-                        vertex, location, attemptId, notifyPartitionDataAvailable),
+                registerProducedPartitions(vertex, location, attemptId),
                 vertex.getExecutionGraphAccessor().getJobMasterMainThreadExecutor(),
                 producedPartitionsCache -> {
                     producedPartitions = producedPartitionsCache;
@@ -435,14 +453,12 @@ public class Execution
                 });
     }
 
-    @VisibleForTesting
-    static CompletableFuture<
+    private static CompletableFuture<
                     Map<IntermediateResultPartitionID, ResultPartitionDeploymentDescriptor>>
             registerProducedPartitions(
                     ExecutionVertex vertex,
                     TaskManagerLocation location,
-                    ExecutionAttemptID attemptId,
-                    boolean notifyPartitionDataAvailable) {
+                    ExecutionAttemptID attemptId) {
 
         ProducerDescriptor producerDescriptor = ProducerDescriptor.create(location, attemptId);
 
@@ -453,10 +469,7 @@ public class Execution
 
         for (IntermediateResultPartition partition : partitions) {
             PartitionDescriptor partitionDescriptor = PartitionDescriptor.from(partition);
-            int maxParallelism =
-                    getPartitionMaxParallelism(
-                            partition,
-                            vertex.getExecutionGraphAccessor()::getExecutionVertexOrThrow);
+            int maxParallelism = getPartitionMaxParallelism(partition);
             CompletableFuture<? extends ShuffleDescriptor> shuffleDescriptorFuture =
                     vertex.getExecutionGraphAccessor()
                             .getShuffleMaster()
@@ -469,8 +482,7 @@ public class Execution
                                     new ResultPartitionDeploymentDescriptor(
                                             partitionDescriptor,
                                             shuffleDescriptor,
-                                            maxParallelism,
-                                            notifyPartitionDataAvailable));
+                                            maxParallelism));
             partitionRegistrations.add(partitionRegistration);
         }
 
@@ -485,14 +497,8 @@ public class Execution
                         });
     }
 
-    private static int getPartitionMaxParallelism(
-            IntermediateResultPartition partition,
-            Function<ExecutionVertexID, ExecutionVertex> getVertexById) {
-        final ConsumerVertexGroup consumerVertexGroup = partition.getConsumerVertexGroup();
-        return getVertexById
-                .apply(consumerVertexGroup.getFirst())
-                .getJobVertex()
-                .getMaxParallelism();
+    private static int getPartitionMaxParallelism(IntermediateResultPartition partition) {
+        return partition.getIntermediateResult().getConsumersMaxParallelism();
     }
 
     /**
@@ -517,9 +523,8 @@ public class Execution
         }
 
         // make sure exactly one deployment call happens from the correct state
-        // note: the transition from CREATED to DEPLOYING is for testing purposes only
         ExecutionState previous = this.state;
-        if (previous == SCHEDULED || previous == CREATED) {
+        if (previous == SCHEDULED) {
             if (!transitionState(previous, DEPLOYING)) {
                 // race condition, someone else beat us to the deploying call.
                 // this should actually not happen and indicates a race somewhere else
@@ -529,7 +534,7 @@ public class Execution
         } else {
             // vertex may have been cancelled, or it was already scheduled
             throw new IllegalStateException(
-                    "The vertex must be in CREATED or SCHEDULED state to be deployed. Found state "
+                    "The vertex must be in SCHEDULED state to be deployed. Found state "
                             + previous);
         }
 
@@ -554,15 +559,16 @@ public class Execution
             }
 
             LOG.info(
-                    "Deploying {} (attempt #{}) with attempt id {} to {} with allocation id {}",
+                    "Deploying {} (attempt #{}) with attempt id {} and vertex id {} to {} with allocation id {}",
                     vertex.getTaskNameWithSubtaskIndex(),
-                    attemptNumber,
-                    vertex.getCurrentExecutionAttempt().getAttemptId(),
+                    getAttemptNumber(),
+                    attemptId,
+                    vertex.getID(),
                     getAssignedResourceLocation(),
                     slot.getAllocationId());
 
             final TaskDeploymentDescriptor deployment =
-                    TaskDeploymentDescriptorFactory.fromExecutionVertex(vertex, attemptNumber)
+                    TaskDeploymentDescriptorFactory.fromExecution(this)
                             .createDeploymentDescriptor(
                                     slot.getAllocationId(),
                                     taskRestore,
@@ -710,27 +716,40 @@ public class Execution
     }
 
     private void updatePartitionConsumers(final IntermediateResultPartition partition) {
-        final ConsumerVertexGroup consumerVertexGroup = partition.getConsumerVertexGroup();
-        for (ExecutionVertexID consumerVertexId : consumerVertexGroup) {
-            final ExecutionVertex consumerVertex =
-                    vertex.getExecutionGraphAccessor().getExecutionVertexOrThrow(consumerVertexId);
-            final Execution consumer = consumerVertex.getCurrentExecutionAttempt();
-            final ExecutionState consumerState = consumer.getState();
+        final List<ConsumerVertexGroup> consumerVertexGroups = partition.getConsumerVertexGroups();
+        if (consumerVertexGroups.isEmpty()) {
+            return;
+        }
+        final Set<ExecutionVertexID> updatedVertices = new HashSet<>();
+        for (ConsumerVertexGroup consumerVertexGroup : consumerVertexGroups) {
+            for (ExecutionVertexID consumerVertexId : consumerVertexGroup) {
+                if (updatedVertices.contains(consumerVertexId)) {
+                    continue;
+                }
 
-            // ----------------------------------------------------------------
-            // Consumer is recovering or running => send update message now
-            // Consumer is deploying => cache the partition info which would be
-            // sent after switching to running
-            // ----------------------------------------------------------------
-            if (consumerState == DEPLOYING
-                    || consumerState == RUNNING
-                    || consumerState == INITIALIZING) {
-                final PartitionInfo partitionInfo = createPartitionInfo(partition);
+                final ExecutionVertex consumerVertex =
+                        vertex.getExecutionGraphAccessor()
+                                .getExecutionVertexOrThrow(consumerVertexId);
+                final Execution consumer = consumerVertex.getCurrentExecutionAttempt();
+                final ExecutionState consumerState = consumer.getState();
 
-                if (consumerState == DEPLOYING) {
-                    consumerVertex.cachePartitionInfo(partitionInfo);
-                } else {
-                    consumer.sendUpdatePartitionInfoRpcCall(Collections.singleton(partitionInfo));
+                // ----------------------------------------------------------------
+                // Consumer is recovering or running => send update message now
+                // Consumer is deploying => cache the partition info which would be
+                // sent after switching to running
+                // ----------------------------------------------------------------
+                if (consumerState == DEPLOYING
+                        || consumerState == RUNNING
+                        || consumerState == INITIALIZING) {
+                    final PartitionInfo partitionInfo = createPartitionInfo(partition);
+                    updatedVertices.add(consumerVertexId);
+
+                    if (consumerState == DEPLOYING) {
+                        consumerVertex.cachePartitionInfo(partitionInfo);
+                    } else {
+                        consumer.sendUpdatePartitionInfoRpcCall(
+                                Collections.singleton(partitionInfo));
+                    }
                 }
             }
         }
@@ -845,13 +864,6 @@ public class Execution
     private CompletableFuture<Acknowledge> triggerCheckpointHelper(
             long checkpointId, long timestamp, CheckpointOptions checkpointOptions) {
 
-        final CheckpointType checkpointType = checkpointOptions.getCheckpointType();
-        if (checkpointType.getPostCheckpointAction() == PostCheckpointAction.TERMINATE
-                && !(checkpointType.isSynchronous() && checkpointType.isSavepoint())) {
-            throw new IllegalArgumentException(
-                    "Only synchronous savepoints are allowed to advance the watermark to MAX.");
-        }
-
         final LogicalSlot slot = assignedResource;
 
         if (slot != null) {
@@ -900,7 +912,7 @@ public class Execution
      *
      * @param t The exception that caused the task to fail.
      */
-    void markFailed(Throwable t) {
+    public void markFailed(Throwable t) {
         processFail(t, false);
     }
 
@@ -1214,8 +1226,8 @@ public class Execution
             } else {
                 String message =
                         String.format(
-                                "Concurrent unexpected state transition of task %s to %s while deployment was in progress.",
-                                getVertexWithAttempt(), currentState);
+                                "Concurrent unexpected state transition of task %s from %s (expected %s) to %s while deployment was in progress.",
+                                getAttemptId(), currentState, from, to);
 
                 LOG.debug(message);
 
@@ -1311,7 +1323,7 @@ public class Execution
                                     resultPartitionDeploymentDescriptor ->
                                             resultPartitionDeploymentDescriptor
                                                     .getPartitionType()
-                                                    .isPipelined())
+                                                    .isReleaseByUpstream())
                             .map(ResultPartitionDeploymentDescriptor::getShuffleDescriptor)
                             .peek(shuffleMaster::releasePartitionExternally)
                             .map(ShuffleDescriptor::getResultPartitionID)
@@ -1417,7 +1429,7 @@ public class Execution
 
         if (state == currentState) {
             state = targetState;
-            markTimestamp(targetState);
+            markTimestamp(currentState, targetState);
 
             if (error == null) {
                 LOG.info(
@@ -1447,7 +1459,7 @@ public class Execution
             // make sure that the state transition completes normally.
             // potential errors (in listeners may not affect the main logic)
             try {
-                vertex.notifyStateTransition(this, targetState);
+                vertex.notifyStateTransition(this, currentState, targetState);
             } catch (Throwable t) {
                 LOG.error(
                         "Error while notifying execution graph of execution state transition.", t);
@@ -1466,16 +1478,22 @@ public class Execution
         }
     }
 
-    private void markTimestamp(ExecutionState state) {
-        markTimestamp(state, System.currentTimeMillis());
+    private void markTimestamp(ExecutionState currentState, ExecutionState targetState) {
+        long now = System.currentTimeMillis();
+        markTimestamp(targetState, now);
+        markEndTimestamp(currentState, now);
     }
 
     private void markTimestamp(ExecutionState state, long timestamp) {
         this.stateTimestamps[state.ordinal()] = timestamp;
     }
 
+    private void markEndTimestamp(ExecutionState state, long timestamp) {
+        this.stateEndTimestamps[state.ordinal()] = timestamp;
+    }
+
     public String getVertexWithAttempt() {
-        return vertex.getTaskNameWithSubtaskIndex() + " - execution #" + attemptNumber;
+        return vertex.getTaskNameWithSubtaskIndex() + " - execution #" + getAttemptNumber();
     }
 
     // ------------------------------------------------------------------------
@@ -1544,7 +1562,7 @@ public class Execution
 
         return String.format(
                 "Attempt #%d (%s) @ %s - [%s]",
-                attemptNumber,
+                getAttemptNumber(),
                 vertex.getTaskNameWithSubtaskIndex(),
                 (slot == null ? "(unassigned)" : slot),
                 state);

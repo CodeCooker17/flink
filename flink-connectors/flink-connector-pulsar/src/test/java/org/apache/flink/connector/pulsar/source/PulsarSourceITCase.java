@@ -23,29 +23,41 @@ import org.apache.flink.connector.pulsar.testutils.PulsarTestEnvironment;
 import org.apache.flink.connector.pulsar.testutils.cases.MultipleTopicConsumingContext;
 import org.apache.flink.connector.pulsar.testutils.cases.SingleTopicConsumingContext;
 import org.apache.flink.connector.pulsar.testutils.runtime.PulsarRuntime;
-import org.apache.flink.connectors.test.common.environment.MiniClusterTestEnvironment;
-import org.apache.flink.connectors.test.common.junit.annotations.ExternalContextFactory;
-import org.apache.flink.connectors.test.common.junit.annotations.ExternalSystem;
-import org.apache.flink.connectors.test.common.junit.annotations.TestEnv;
-import org.apache.flink.connectors.test.common.testsuites.SourceTestSuiteBase;
+import org.apache.flink.connector.testframe.environment.MiniClusterTestEnvironment;
+import org.apache.flink.connector.testframe.junit.annotations.TestContext;
+import org.apache.flink.connector.testframe.junit.annotations.TestEnv;
+import org.apache.flink.connector.testframe.junit.annotations.TestExternalSystem;
+import org.apache.flink.connector.testframe.junit.annotations.TestSemantics;
+import org.apache.flink.connector.testframe.testsuites.SourceTestSuiteBase;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.testutils.junit.FailsOnJava11;
 
-/** Unite test class for {@link PulsarSource}. */
-@SuppressWarnings("unused")
+import org.apache.pulsar.client.api.SubscriptionType;
+import org.junit.experimental.categories.Category;
+
+/**
+ * Unit test class for {@link PulsarSource}. Used for {@link SubscriptionType#Exclusive}
+ * subscription.
+ */
+@Category(value = {FailsOnJava11.class})
 class PulsarSourceITCase extends SourceTestSuiteBase<String> {
-
     // Defines test environment on Flink MiniCluster
     @TestEnv MiniClusterTestEnvironment flink = new MiniClusterTestEnvironment();
 
     // Defines pulsar running environment
-    @ExternalSystem PulsarTestEnvironment pulsar = new PulsarTestEnvironment(PulsarRuntime.mock());
+    @TestExternalSystem
+    PulsarTestEnvironment pulsar = new PulsarTestEnvironment(PulsarRuntime.mock());
 
-    // Defines a external context Factories,
-    // so test cases will be invoked using this external contexts.
-    @ExternalContextFactory
+    @TestSemantics
+    CheckpointingMode[] semantics = new CheckpointingMode[] {CheckpointingMode.EXACTLY_ONCE};
+
+    // Defines an external context Factories,
+    // so test cases will be invoked using these external contexts.
+    @TestContext
     PulsarTestContextFactory<String, SingleTopicConsumingContext> singleTopic =
             new PulsarTestContextFactory<>(pulsar, SingleTopicConsumingContext::new);
 
-    @ExternalContextFactory
+    @TestContext
     PulsarTestContextFactory<String, MultipleTopicConsumingContext> multipleTopic =
             new PulsarTestContextFactory<>(pulsar, MultipleTopicConsumingContext::new);
 }

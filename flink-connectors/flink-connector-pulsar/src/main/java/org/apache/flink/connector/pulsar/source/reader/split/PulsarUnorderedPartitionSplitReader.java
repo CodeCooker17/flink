@@ -19,8 +19,6 @@
 package org.apache.flink.connector.pulsar.source.reader.split;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.pulsar.common.utils.PulsarTransactionUtils;
 import org.apache.flink.connector.pulsar.source.config.SourceConfiguration;
 import org.apache.flink.connector.pulsar.source.reader.deserializer.PulsarDeserializationSchema;
 import org.apache.flink.connector.pulsar.source.reader.source.PulsarUnorderedSourceReader;
@@ -42,11 +40,12 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.flink.connector.pulsar.common.utils.PulsarExceptionUtils.sneakyClient;
+import static org.apache.flink.connector.pulsar.common.utils.PulsarTransactionUtils.createTransaction;
 
 /**
  * The split reader a given {@link PulsarPartitionSplit}, it would be closed once the {@link
@@ -59,8 +58,6 @@ public class PulsarUnorderedPartitionSplitReader<OUT> extends PulsarPartitionSpl
     private static final Logger LOG =
             LoggerFactory.getLogger(PulsarUnorderedPartitionSplitReader.class);
 
-    private static final Duration REDELIVER_TIME = Duration.ofSeconds(3);
-
     private final TransactionCoordinatorClient coordinatorClient;
 
     @Nullable private Transaction uncommittedTransaction;
@@ -68,11 +65,10 @@ public class PulsarUnorderedPartitionSplitReader<OUT> extends PulsarPartitionSpl
     public PulsarUnorderedPartitionSplitReader(
             PulsarClient pulsarClient,
             PulsarAdmin pulsarAdmin,
-            Configuration configuration,
             SourceConfiguration sourceConfiguration,
             PulsarDeserializationSchema<OUT> deserializationSchema,
             TransactionCoordinatorClient coordinatorClient) {
-        super(pulsarClient, pulsarAdmin, configuration, sourceConfiguration, deserializationSchema);
+        super(pulsarClient, pulsarAdmin, sourceConfiguration, deserializationSchema);
 
         this.coordinatorClient = coordinatorClient;
     }
@@ -100,17 +96,7 @@ public class PulsarUnorderedPartitionSplitReader<OUT> extends PulsarPartitionSpl
                         .acknowledgeAsync(message.getMessageId(), uncommittedTransaction)
                         .get();
             } catch (InterruptedException e) {
-                sneakyClient(
-                        () ->
-                                pulsarConsumer.reconsumeLater(
-                                        message, REDELIVER_TIME.toMillis(), TimeUnit.MILLISECONDS));
                 Thread.currentThread().interrupt();
-                throw e;
-            } catch (ExecutionException e) {
-                sneakyClient(
-                        () ->
-                                pulsarConsumer.reconsumeLater(
-                                        message, REDELIVER_TIME.toMillis(), TimeUnit.MILLISECONDS));
                 throw e;
             }
         }
@@ -129,7 +115,7 @@ public class PulsarUnorderedPartitionSplitReader<OUT> extends PulsarPartitionSpl
     }
 
     @Override
-    protected void startConsumer(PulsarPartitionSplit split, Consumer<byte[]> consumer) {
+    protected void afterCreatingConsumer(PulsarPartitionSplit split, Consumer<byte[]> consumer) {
         TxnID uncommittedTransactionId = split.getUncommittedTransactionId();
 
         // Abort the uncommitted pulsar transaction.
@@ -150,33 +136,25 @@ public class PulsarUnorderedPartitionSplitReader<OUT> extends PulsarPartitionSpl
         }
     }
 
-    public PulsarPartitionSplitState snapshotState(long checkpointId) {
+    public Optional<PulsarPartitionSplitState> snapshotState() {
+        if (registeredSplit == null) {
+            return Optional.empty();
+        }
+
         PulsarPartitionSplitState state = new PulsarPartitionSplitState(registeredSplit);
 
         // Avoiding NP problem when Pulsar don't get the message before Flink checkpoint.
         if (uncommittedTransaction != null) {
-            TxnID txnID = PulsarTransactionUtils.getId(uncommittedTransaction);
+            TxnID txnID = uncommittedTransaction.getTxnID();
             this.uncommittedTransaction = newTransaction();
             state.setUncommittedTransactionId(txnID);
         }
 
-        return state;
+        return Optional.of(state);
     }
 
     private Transaction newTransaction() {
         long timeoutMillis = sourceConfiguration.getTransactionTimeoutMillis();
-        CompletableFuture<Transaction> future =
-                sneakyClient(pulsarClient::newTransaction)
-                        .withTransactionTimeout(timeoutMillis, TimeUnit.MILLISECONDS)
-                        .build();
-
-        try {
-            return future.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException(e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
-        }
+        return createTransaction(pulsarClient, timeoutMillis);
     }
 }

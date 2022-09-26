@@ -40,6 +40,7 @@ import org.apache.flink.table.expressions.ExpressionVisitor;
 import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.TypeLiteralExpression;
 import org.apache.flink.table.expressions.ValueLiteralExpression;
+import org.apache.flink.table.factories.ManagedTableFactory;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.functions.hive.conversion.HiveInspectors;
@@ -59,6 +60,7 @@ import org.apache.hadoop.hive.ql.io.RCFileStorageFormatDescriptor;
 import org.apache.hadoop.hive.ql.io.StorageFormatDescriptor;
 import org.apache.hadoop.hive.ql.io.StorageFormatFactory;
 import org.apache.hadoop.hive.serde.serdeConstants;
+import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
 
 import java.io.File;
@@ -297,7 +299,7 @@ public class HiveTableUtil {
         }
     }
 
-    private static void extractStoredAs(
+    public static void extractStoredAs(
             StorageDescriptor sd, Map<String, String> properties, HiveConf hiveConf) {
         String storageFormat = properties.remove(STORED_AS_FILE_FORMAT);
         String inputFormat = properties.remove(STORED_AS_INPUT_FORMAT);
@@ -332,6 +334,14 @@ public class HiveTableUtil {
         setStorageFormat(sd, hiveConf.getVar(HiveConf.ConfVars.HIVEDEFAULTFILEFORMAT), hiveConf);
     }
 
+    public static void setDefaultStorageFormatForDirectory(
+            StorageDescriptor sd, HiveConf hiveConf) {
+        // default is LazySimpleSerDe for insert into directory
+        sd.getSerdeInfo().setSerializationLib(LazySimpleSerDe.class.getName());
+        // default is TextFile
+        setStorageFormat(sd, "TextFile", hiveConf);
+    }
+
     public static void alterColumns(StorageDescriptor sd, CatalogTable catalogTable) {
         List<FieldSchema> allCols = HiveTableUtil.createHiveColumns(catalogTable.getSchema());
         List<FieldSchema> nonPartCols =
@@ -351,8 +361,9 @@ public class HiveTableUtil {
             ObjectPath tablePath,
             CatalogBaseTable baseTable,
             Table oldHiveTable,
-            HiveConf hiveConf) {
-        Table newHiveTable = instantiateHiveTable(tablePath, baseTable, hiveConf);
+            HiveConf hiveConf,
+            boolean managedTable) {
+        Table newHiveTable = instantiateHiveTable(tablePath, baseTable, hiveConf, managedTable);
         // client.alter_table() requires a valid location
         // thus, if new table doesn't have that, it reuses location of the old table
         if (!newHiveTable.getSd().isSetLocation()) {
@@ -362,7 +373,7 @@ public class HiveTableUtil {
     }
 
     public static Table instantiateHiveTable(
-            ObjectPath tablePath, CatalogBaseTable table, HiveConf hiveConf) {
+            ObjectPath tablePath, CatalogBaseTable table, HiveConf hiveConf, boolean managedTable) {
         final boolean isView = table instanceof CatalogView;
         // let Hive set default parameters for us, e.g. serialization.format
         Table hiveTable =
@@ -371,6 +382,9 @@ public class HiveTableUtil {
         hiveTable.setCreateTime((int) (System.currentTimeMillis() / 1000));
 
         Map<String, String> properties = new HashMap<>(table.getOptions());
+        if (managedTable) {
+            properties.put(CONNECTOR.key(), ManagedTableFactory.DEFAULT_IDENTIFIER);
+        }
         // Table comment
         if (table.getComment() != null) {
             properties.put(HiveCatalogConfig.COMMENT, table.getComment());

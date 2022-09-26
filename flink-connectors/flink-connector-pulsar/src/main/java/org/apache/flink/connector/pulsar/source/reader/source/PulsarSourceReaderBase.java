@@ -19,9 +19,8 @@
 package org.apache.flink.connector.pulsar.source.reader.source;
 
 import org.apache.flink.api.connector.source.SourceReaderContext;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
-import org.apache.flink.connector.base.source.reader.SingleThreadMultiplexSourceReaderBase;
+import org.apache.flink.connector.base.source.reader.SourceReaderBase;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.pulsar.source.config.SourceConfiguration;
 import org.apache.flink.connector.pulsar.source.reader.emitter.PulsarRecordEmitter;
@@ -33,13 +32,15 @@ import org.apache.flink.connector.pulsar.source.split.PulsarPartitionSplitState;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.PulsarClient;
 
+import java.util.Collection;
+
 /**
  * The common pulsar source reader for both ordered & unordered message consuming.
  *
  * @param <OUT> The output message type for flink.
  */
 abstract class PulsarSourceReaderBase<OUT>
-        extends SingleThreadMultiplexSourceReaderBase<
+        extends SourceReaderBase<
                 PulsarMessage<OUT>, OUT, PulsarPartitionSplit, PulsarPartitionSplitState> {
 
     protected final SourceConfiguration sourceConfiguration;
@@ -49,7 +50,6 @@ abstract class PulsarSourceReaderBase<OUT>
     protected PulsarSourceReaderBase(
             FutureCompletingBlockingQueue<RecordsWithSplitIds<PulsarMessage<OUT>>> elementsQueue,
             PulsarFetcherManagerBase<OUT> splitFetcherManager,
-            Configuration configuration,
             SourceReaderContext context,
             SourceConfiguration sourceConfiguration,
             PulsarClient pulsarClient,
@@ -58,7 +58,7 @@ abstract class PulsarSourceReaderBase<OUT>
                 elementsQueue,
                 splitFetcherManager,
                 new PulsarRecordEmitter<>(),
-                configuration,
+                sourceConfiguration,
                 context);
 
         this.sourceConfiguration = sourceConfiguration;
@@ -75,6 +75,12 @@ abstract class PulsarSourceReaderBase<OUT>
     protected PulsarPartitionSplit toSplitType(
             String splitId, PulsarPartitionSplitState splitState) {
         return splitState.toPulsarPartitionSplit();
+    }
+
+    @Override
+    public void pauseOrResumeSplits(
+            Collection<String> splitsToPause, Collection<String> splitsToResume) {
+        splitFetcherManager.pauseOrResumeSplits(splitsToPause, splitsToResume);
     }
 
     @Override

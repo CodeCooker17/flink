@@ -22,15 +22,14 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.runtime.executiongraph.IntermediateResult;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
-import org.apache.flink.runtime.scheduler.strategy.ConsumerVertexGroup;
 
 import java.io.Serializable;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
-import static org.apache.flink.util.Preconditions.checkState;
 
 /** Partition descriptor for {@link ShuffleMaster} to obtain {@link ShuffleDescriptor}. */
 public class PartitionDescriptor implements Serializable {
@@ -55,6 +54,15 @@ public class PartitionDescriptor implements Serializable {
     /** Connection index to identify this partition of intermediate result. */
     private final int connectionIndex;
 
+    /** Whether the intermediate result is a broadcast result. */
+    private final boolean isBroadcast;
+
+    /**
+     * Whether the distribution pattern of the intermediate result is {@link
+     * DistributionPattern.ALL_TO_ALL}.
+     */
+    private final boolean isAllToAllDistribution;
+
     @VisibleForTesting
     public PartitionDescriptor(
             IntermediateDataSetID resultId,
@@ -62,7 +70,9 @@ public class PartitionDescriptor implements Serializable {
             IntermediateResultPartitionID partitionId,
             ResultPartitionType partitionType,
             int numberOfSubpartitions,
-            int connectionIndex) {
+            int connectionIndex,
+            boolean isBroadcast,
+            boolean isAllToAllDistribution) {
         this.resultId = checkNotNull(resultId);
         checkArgument(totalNumberOfPartitions >= 1);
         this.totalNumberOfPartitions = totalNumberOfPartitions;
@@ -71,6 +81,8 @@ public class PartitionDescriptor implements Serializable {
         checkArgument(numberOfSubpartitions >= 1);
         this.numberOfSubpartitions = numberOfSubpartitions;
         this.connectionIndex = connectionIndex;
+        this.isBroadcast = isBroadcast;
+        this.isAllToAllDistribution = isAllToAllDistribution;
     }
 
     public IntermediateDataSetID getResultId() {
@@ -97,23 +109,31 @@ public class PartitionDescriptor implements Serializable {
         return connectionIndex;
     }
 
+    public boolean isBroadcast() {
+        return isBroadcast;
+    }
+
+    public boolean isAllToAllDistribution() {
+        return isAllToAllDistribution;
+    }
+
     @Override
     public String toString() {
         return String.format(
                 "PartitionDescriptor [result id: %s, partition id: %s, partition type: %s, "
-                        + "subpartitions: %d, connection index: %d]",
-                resultId, partitionId, partitionType, numberOfSubpartitions, connectionIndex);
+                        + "subpartitions: %d, connection index: %d, is broadcast: %s, "
+                        + "is all-to-all distribution: %s]",
+                resultId,
+                partitionId,
+                partitionType,
+                numberOfSubpartitions,
+                connectionIndex,
+                isBroadcast,
+                isAllToAllDistribution);
     }
 
     public static PartitionDescriptor from(IntermediateResultPartition partition) {
         checkNotNull(partition);
-
-        ConsumerVertexGroup consumerVertexGroup = partition.getConsumerVertexGroup();
-        checkState(consumerVertexGroup.size() > 0);
-
-        // The produced data is partitioned among a number of subpartitions, one for each consuming
-        // sub task.
-        int numberOfSubpartitions = consumerVertexGroup.size();
 
         IntermediateResult result = partition.getIntermediateResult();
         return new PartitionDescriptor(
@@ -121,7 +141,9 @@ public class PartitionDescriptor implements Serializable {
                 partition.getIntermediateResult().getNumberOfAssignedPartitions(),
                 partition.getPartitionId(),
                 result.getResultType(),
-                numberOfSubpartitions,
-                result.getConnectionIndex());
+                partition.getNumberOfSubpartitions(),
+                result.getConnectionIndex(),
+                result.isBroadcast(),
+                result.getConsumingDistributionPattern() == DistributionPattern.ALL_TO_ALL);
     }
 }

@@ -44,7 +44,9 @@ This connector provides access to data streams from [RabbitMQ](http://www.rabbit
 
 {{< artifact flink-connector-rabbitmq >}}
 
-Note that the streaming connectors are currently not part of the binary distribution. See linking with them for cluster execution [here]({{< ref "docs/dev/datastream/project-configuration" >}}).
+{{< py_download_link "rabbitmq" >}}
+
+Note that the streaming connectors are currently not part of the binary distribution. See linking with them for cluster execution [here]({{< ref "docs/dev/configuration/overview" >}}).
 
 ### Installing RabbitMQ
 Follow the instructions from the [RabbitMQ download page](http://www.rabbitmq.com/download.html). After the installation the server automatically starts, and the application connecting to RabbitMQ can be launched.
@@ -175,6 +177,14 @@ val connectionConfig = new RMQConnectionConfig.Builder()
     .build
 ```
 {{< /tab >}}
+{{< tab "Python" >}}
+```python
+connection_config = RMQConnectionConfig.Builder() \
+    .set_prefetch_count(30000) \
+    ...
+    .build()
+```
+{{< /tab >}}
 {{< /tabs >}}
 
 The prefetch count is unset by default, meaning the RabbitMQ server will send unlimited messages. In production, it
@@ -219,6 +229,22 @@ stream.addSink(new RMQSink[String](
     connectionConfig,         // config for the RabbitMQ connection
     "queueName",              // name of the RabbitMQ queue to send messages to
     new SimpleStringSchema))  // serialization schema to turn Java objects to messages
+```
+{{< /tab >}}
+{{< tab "Python" >}}
+```python
+stream = ...
+
+connection_config = RMQConnectionConfig.Builder() \
+    .set_host("localhost") \
+    .set_port(5000) \
+    ...
+    .build()
+
+stream.add_sink(RMQSink(
+    connection_config,      # config for the RabbitMQ connection
+    'queueName',            # name of the RabbitMQ queue to send messages to
+    SimpleStringSchema()))  # serialization schema to turn Java objects to messages
 ```
 {{< /tab >}}
 {{< /tabs >}}

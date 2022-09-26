@@ -38,13 +38,15 @@
 
 avro:
     name: Avro
-    maven: flink-sql-avro
+    maven: flink-avro
     category: format
     sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-avro/$version/flink-sql-avro-$version.jar
 
 avro-confluent:
     name: Avro Schema Registry
-    maven: flink-avro-confluent-registry
+    maven:
+      - flink-avro-confluent-registry
+      - flink-avro
     category: format
     sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-avro-confluent-registry/$version/flink-sql-avro-confluent-registry-$version.jar
 
@@ -59,6 +61,12 @@ parquet:
     maven: flink-parquet
     category: format
     sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-parquet/$version/flink-sql-parquet-$version.jar
+
+protobuf:
+  name: Protobuf
+  maven: flink-protobuf
+  category: format
+  sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-protobuf/$version/flink-sql-protobuf-$version.jar
 
 debezium-avro-confluent:
     name: Debezium
@@ -82,6 +90,12 @@ maxwell:
     name: Maxwell
     maven: flink-json
     category: format
+    builtin: true
+
+ogg-json:
+    name: Ogg
+    maven: flink-json
+    catagory: format
     builtin: true
 
 csv:
@@ -114,10 +128,10 @@ elastic:
     versions:
         - version: 6.x
           maven: flink-connector-elasticsearch6
-          sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-elasticsearch6/$version/flink-sql-connector-elasticsearch6-$version.jar
+          sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-elasticsearch6/1.16.0/flink-sql-connector-elasticsearch6-1.16.0.jar
         - version: 7.x and later versions
           maven: flink-connector-elasticsearch7
-          sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-elasticsearch7/$version/flink-sql-connector-elasticsearch7-$version.jar
+          sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-elasticsearch7/1.16.0/flink-sql-connector-elasticsearch7-1.16.0.jar
 
 hbase:
     name: HBase
@@ -158,3 +172,20 @@ kinesis:
     maven: flink-connector-kinesis
     sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kinesis/$version/flink-sql-connector-kinesis-$version.jar
 
+aws-kinesis-firehose:
+  name: AWS Kinesis Firehose
+  category: connector
+  maven: flink-connector-kinesis-firehose
+  sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-aws-kinesis-firehose/$version/flink-sql-connector-aws-kinesis-firehose-$version.jar
+
+pulsar:
+    name: Pulsar
+    category: connector
+    maven: flink-connector-pulsar
+    sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-pulsar/$version/flink-sql-connector-pulsar-$version.jar
+
+rabbitmq:
+    name: RabbitMQ
+    category: connector
+    maven: flink-connector-rabbitmq
+    sql_url: https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-rabbitmq/$version/flink-sql-connector-rabbitmq-$version.jar

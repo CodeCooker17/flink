@@ -18,6 +18,8 @@
 
 package org.apache.flink.table.planner.delegation.hive.parse;
 
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple4;
 import org.apache.flink.sql.parser.hive.ddl.HiveDDLUtils;
 import org.apache.flink.sql.parser.hive.ddl.SqlAlterHiveDatabase;
 import org.apache.flink.sql.parser.hive.ddl.SqlCreateHiveTable;
@@ -40,6 +42,8 @@ import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.CatalogTableImpl;
 import org.apache.flink.table.catalog.CatalogView;
 import org.apache.flink.table.catalog.CatalogViewImpl;
+import org.apache.flink.table.catalog.ContextResolvedTable;
+import org.apache.flink.table.catalog.FunctionCatalog;
 import org.apache.flink.table.catalog.FunctionLanguage;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
@@ -48,14 +52,17 @@ import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.table.catalog.hive.HiveCatalog;
 import org.apache.flink.table.catalog.hive.client.HiveShim;
+import org.apache.flink.table.catalog.hive.client.HiveShimLoader;
 import org.apache.flink.table.catalog.hive.factories.HiveFunctionDefinitionFactory;
 import org.apache.flink.table.catalog.hive.util.HiveTableUtil;
 import org.apache.flink.table.catalog.hive.util.HiveTypeUtil;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.functions.FunctionDefinition;
-import org.apache.flink.table.operations.CatalogSinkModifyOperation;
+import org.apache.flink.table.functions.hive.HiveFunctionWrapper;
+import org.apache.flink.table.functions.hive.HiveGenericUDF;
 import org.apache.flink.table.operations.DescribeTableOperation;
 import org.apache.flink.table.operations.Operation;
+import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.operations.ShowDatabasesOperation;
 import org.apache.flink.table.operations.ShowFunctionsOperation;
 import org.apache.flink.table.operations.ShowPartitionsOperation;
@@ -83,6 +90,7 @@ import org.apache.flink.table.operations.ddl.DropPartitionsOperation;
 import org.apache.flink.table.operations.ddl.DropTableOperation;
 import org.apache.flink.table.operations.ddl.DropTempSystemFunctionOperation;
 import org.apache.flink.table.operations.ddl.DropViewOperation;
+import org.apache.flink.table.planner.calcite.FlinkContext;
 import org.apache.flink.table.planner.delegation.hive.HiveParser;
 import org.apache.flink.table.planner.delegation.hive.HiveParserCalcitePlanner;
 import org.apache.flink.table.planner.delegation.hive.HiveParserConstants;
@@ -94,25 +102,39 @@ import org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanti
 import org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanticAnalyzer.HiveParserRowFormatParams;
 import org.apache.flink.table.planner.delegation.hive.copy.HiveParserContext;
 import org.apache.flink.table.planner.delegation.hive.copy.HiveParserQueryState;
+import org.apache.flink.table.planner.delegation.hive.copy.HiveParserRowResolver;
+import org.apache.flink.table.planner.delegation.hive.copy.HiveParserSemanticAnalyzer;
 import org.apache.flink.table.planner.delegation.hive.copy.HiveParserStorageFormat;
+import org.apache.flink.table.planner.delegation.hive.operations.HiveShowCreateTableOperation;
 import org.apache.flink.table.planner.utils.OperationConverterUtils;
+import org.apache.flink.table.resource.ResourceType;
+import org.apache.flink.table.resource.ResourceUri;
 
 import org.antlr.runtime.tree.CommonTree;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.tools.FrameworkConfig;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.SkewedInfo;
 import org.apache.hadoop.hive.ql.ErrorMsg;
+import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.exec.FunctionUtils;
+import org.apache.hadoop.hive.ql.lib.Node;
+import org.apache.hadoop.hive.ql.lib.PreOrderWalker;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
+import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.HiveOperation;
 import org.apache.hadoop.hive.ql.plan.PrincipalDesc;
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDFMacro;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.typeinfo.CharTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.DecimalTypeInfo;
+import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
 import org.apache.hadoop.hive.serde2.typeinfo.VarcharTypeInfo;
 import org.slf4j.Logger;
@@ -123,6 +145,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -159,6 +182,8 @@ import static org.apache.flink.sql.parser.hive.ddl.SqlCreateHiveTable.TABLE_IS_E
 import static org.apache.flink.sql.parser.hive.ddl.SqlCreateHiveTable.TABLE_LOCATION_URI;
 import static org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanticAnalyzer.NotNullConstraint;
 import static org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanticAnalyzer.PrimaryKey;
+import static org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanticAnalyzer.getColumns;
+import static org.apache.flink.table.planner.delegation.hive.copy.HiveParserBaseSemanticAnalyzer.stripQuotes;
 
 /**
  * Ported hive's org.apache.hadoop.hive.ql.parse.DDLSemanticAnalyzer, and also incorporated
@@ -180,6 +205,10 @@ public class HiveParserDDLSemanticAnalyzer {
     private final HiveShim hiveShim;
     private final HiveParserContext context;
     private final HiveParserDMLHelper dmlHelper;
+    private final FrameworkConfig frameworkConfig;
+    private final RelOptCluster cluster;
+    private final ClassLoader classLoader;
+    private final FunctionCatalog functionCatalog;
 
     static {
         TokenToTypeName.put(HiveASTParser.TOK_BOOLEAN, serdeConstants.BOOLEAN_TYPE_NAME);
@@ -240,7 +269,10 @@ public class HiveParserDDLSemanticAnalyzer {
             HiveParser hiveParser,
             HiveShim hiveShim,
             HiveParserContext context,
-            HiveParserDMLHelper dmlHelper)
+            HiveParserDMLHelper dmlHelper,
+            FrameworkConfig frameworkConfig,
+            RelOptCluster cluster,
+            FlinkContext flinkContext)
             throws SemanticException {
         this.queryState = queryState;
         this.conf = queryState.getConf();
@@ -252,6 +284,10 @@ public class HiveParserDDLSemanticAnalyzer {
         this.hiveShim = hiveShim;
         this.context = context;
         this.dmlHelper = dmlHelper;
+        this.frameworkConfig = frameworkConfig;
+        this.cluster = cluster;
+        this.classLoader = flinkContext.getClassLoader();
+        this.functionCatalog = flinkContext.getFunctionCatalog();
         reservedPartitionValues = new HashSet<>();
         // Partition can't have this name
         reservedPartitionValues.add(HiveConf.getVar(conf, HiveConf.ConfVars.DEFAULTPARTITIONNAME));
@@ -337,6 +373,15 @@ public class HiveParserDDLSemanticAnalyzer {
             case HiveASTParser.TOK_DROPFUNCTION:
                 res = convertDropFunction(ast);
                 break;
+            case HiveASTParser.TOK_CREATEMACRO:
+                res = convertCreateMacro(ast);
+                break;
+            case HiveASTParser.TOK_DROPMACRO:
+                res = convertDropMacro(ast);
+                break;
+            case HiveASTParser.TOK_SHOW_CREATETABLE:
+                res = convertShowCreateTable(ast);
+                break;
             case HiveASTParser.TOK_DESCFUNCTION:
             case HiveASTParser.TOK_DESCDATABASE:
             case HiveASTParser.TOK_TRUNCATETABLE:
@@ -373,7 +418,6 @@ public class HiveParserDDLSemanticAnalyzer {
             case HiveASTParser.TOK_SHOW_TABLESTATUS:
             case HiveASTParser.TOK_SHOW_TBLPROPERTIES:
             case HiveASTParser.TOK_SHOWCONF:
-            case HiveASTParser.TOK_SHOW_CREATETABLE:
             default:
                 handleUnsupportedOperation(ast);
         }
@@ -474,7 +518,7 @@ public class HiveParserDDLSemanticAnalyzer {
         }
     }
 
-    private Operation convertCreateFunction(HiveParserASTNode ast) {
+    private Operation convertCreateFunction(HiveParserASTNode ast) throws SemanticException {
         // ^(TOK_CREATEFUNCTION identifier StringLiteral ({isTempFunction}? => TOK_TEMPORARY))
         String functionName = ast.getChild(0).getText().toLowerCase();
         boolean isTemporaryFunction =
@@ -490,18 +534,193 @@ public class HiveParserDDLSemanticAnalyzer {
                     "Temporary function cannot be created with a qualified name.");
         }
 
+        // find any referenced resources
+        List<ResourceUri> resources = getResourceList(ast);
+
         if (isTemporaryFunction) {
+            functionCatalog.registerFunctionJarResources(functionName, resources);
             FunctionDefinition funcDefinition =
                     funcDefFactory.createFunctionDefinition(
                             functionName,
-                            new CatalogFunctionImpl(className, FunctionLanguage.JAVA));
+                            new CatalogFunctionImpl(className, FunctionLanguage.JAVA, resources),
+                            () -> classLoader);
             return new CreateTempSystemFunctionOperation(functionName, false, funcDefinition);
         } else {
             ObjectIdentifier identifier = parseObjectIdentifier(functionName);
             CatalogFunction catalogFunction =
-                    new CatalogFunctionImpl(className, FunctionLanguage.JAVA);
+                    new CatalogFunctionImpl(className, FunctionLanguage.JAVA, resources);
             return new CreateCatalogFunctionOperation(identifier, catalogFunction, false, false);
         }
+    }
+
+    private List<ResourceUri> getResourceList(HiveParserASTNode ast) throws SemanticException {
+        List<ResourceUri> resources = new ArrayList<>();
+        HiveParserASTNode resourcesNode =
+                (HiveParserASTNode) ast.getFirstChildWithType(HiveASTParser.TOK_RESOURCE_LIST);
+        if (resourcesNode != null) {
+            for (int idx = 0; idx < resourcesNode.getChildCount(); idx++) {
+                // ^(TOK_RESOURCE_URI $resType $resPath)
+                HiveParserASTNode resNode = (HiveParserASTNode) resourcesNode.getChild(idx);
+                if (resNode.getToken().getType() != HiveASTParser.TOK_RESOURCE_URI) {
+                    throw new SemanticException(
+                            "Expected token type TOK_RESOURCE_URI but found " + resNode.getToken());
+                }
+                if (resNode.getChildCount() != 2) {
+                    throw new SemanticException(
+                            "Expected 2 child nodes of TOK_RESOURCE_URI but found "
+                                    + resNode.getChildCount());
+                }
+                HiveParserASTNode resTypeNode = (HiveParserASTNode) resNode.getChild(0);
+                HiveParserASTNode resUriNode = (HiveParserASTNode) resNode.getChild(1);
+                ResourceType resourceType = getResourceType(resTypeNode);
+                resources.add(new ResourceUri(resourceType, stripQuotes(resUriNode.getText())));
+            }
+        }
+
+        return resources;
+    }
+
+    private ResourceType getResourceType(HiveParserASTNode token) throws SemanticException {
+        switch (token.getType()) {
+            case HiveASTParser.TOK_JAR:
+                return ResourceType.JAR;
+            case HiveASTParser.TOK_FILE:
+                return ResourceType.FILE;
+            case HiveASTParser.TOK_ARCHIVE:
+                return ResourceType.ARCHIVE;
+            default:
+                throw new SemanticException("Unexpected token " + token);
+        }
+    }
+
+    private Operation convertCreateMacro(HiveParserASTNode ast) throws SemanticException {
+        String macroName = ast.getChild(0).getText();
+        if (FunctionUtils.isQualifiedFunctionName(macroName)) {
+            throw new SemanticException(
+                    String.format(
+                            "CREATE TEMPORARY MACRO doesn't allow \".\" character in the macro name, but the name is \"%s\".",
+                            macroName));
+        }
+
+        // macro use table's columns as argument, so get the corresponding column
+        List<FieldSchema> arguments = getColumns((HiveParserASTNode) ast.getChild(1), true);
+        Set<String> actualColumnNames = getActualColumnNames(ast, arguments);
+
+        HiveParserRowResolver rowResolver = new HiveParserRowResolver();
+        Tuple2<List<String>, List<TypeInfo>> macroColumnNameAndType =
+                getMacroColumnData(arguments, actualColumnNames, rowResolver);
+        ExprNodeDesc body = getBody(ast, arguments, rowResolver);
+
+        GenericUDFMacro macro =
+                new GenericUDFMacro(
+                        macroName, body, macroColumnNameAndType.f0, macroColumnNameAndType.f1);
+
+        FunctionDefinition macroDefinition =
+                new HiveGenericUDF(
+                        new HiveFunctionWrapper<>(GenericUDFMacro.class, macro), hiveShim);
+        // hive's marco is more like flink's temp system function
+        return new CreateTempSystemFunctionOperation(macroName, false, macroDefinition);
+    }
+
+    private Set<String> getActualColumnNames(HiveParserASTNode ast, List<FieldSchema> arguments)
+            throws SemanticException {
+        final Set<String> actualColumnNames = new HashSet<>();
+
+        if (!arguments.isEmpty()) {
+            // Walk down expression to see which arguments are actually used.
+            Node expression = (Node) ast.getChild(2);
+
+            PreOrderWalker walker =
+                    new PreOrderWalker(
+                            (nd, stack, nodeOutputs) -> {
+                                if (nd instanceof HiveParserASTNode) {
+                                    HiveParserASTNode node = (HiveParserASTNode) nd;
+                                    if (node.getType() == HiveASTParser.TOK_TABLE_OR_COL) {
+                                        actualColumnNames.add(node.getChild(0).getText());
+                                    }
+                                }
+                                return null;
+                            });
+            walker.startWalking(Collections.singleton(expression), null);
+        }
+        return actualColumnNames;
+    }
+
+    private Tuple2<List<String>, List<TypeInfo>> getMacroColumnData(
+            List<FieldSchema> arguments,
+            Set<String> actualColumnNames,
+            HiveParserRowResolver rowResolver)
+            throws SemanticException {
+        List<String> macroColumnNames = new ArrayList<>();
+        List<TypeInfo> macroColumnTypes = new ArrayList<>();
+        for (FieldSchema argument : arguments) {
+            TypeInfo columnType = TypeInfoUtils.getTypeInfoFromTypeString(argument.getType());
+            rowResolver.put(
+                    StringUtils.EMPTY,
+                    argument.getName(),
+                    new ColumnInfo(argument.getName(), columnType, StringUtils.EMPTY, false));
+            macroColumnNames.add(argument.getName());
+            macroColumnTypes.add(columnType);
+        }
+        Set<String> expectedColumnNames = new LinkedHashSet<>(macroColumnNames);
+        if (!expectedColumnNames.equals(actualColumnNames)) {
+            throw new SemanticException(
+                    String.format(
+                            "Expected columns [%s], but found [%s].",
+                            expectedColumnNames, actualColumnNames));
+        }
+        if (expectedColumnNames.size() != macroColumnNames.size()) {
+            throw new SemanticException(
+                    "At least one parameter name was used more than once " + macroColumnNames);
+        }
+        return Tuple2.of(macroColumnNames, macroColumnTypes);
+    }
+
+    private ExprNodeDesc getBody(
+            HiveParserASTNode ast, List<FieldSchema> arguments, HiveParserRowResolver rowResolver)
+            throws SemanticException {
+        HiveParserSemanticAnalyzer semanticAnalyzer =
+                new HiveParserSemanticAnalyzer(queryState, hiveShim, frameworkConfig, cluster);
+        return arguments.isEmpty()
+                ? semanticAnalyzer.genExprNodeDesc((HiveParserASTNode) ast.getChild(1), rowResolver)
+                : semanticAnalyzer.genExprNodeDesc(
+                        (HiveParserASTNode) ast.getChild(2), rowResolver);
+    }
+
+    private Operation convertDropMacro(HiveParserASTNode ast) throws SemanticException {
+        String macroName = ast.getChild(0).getText();
+        if (FunctionUtils.isQualifiedFunctionName(macroName)) {
+            throw new SemanticException(
+                    String.format(
+                            "DROP TEMPORARY MACRO doesn't allow \".\" character in the macro name, but the name is \"%s\".",
+                            macroName));
+        }
+
+        boolean ifExists = (ast.getFirstChildWithType(HiveASTParser.TOK_IFEXISTS) != null);
+        // macro is always temporary function
+        return new DropTempSystemFunctionOperation(macroName, ifExists);
+    }
+
+    private Operation convertShowCreateTable(HiveParserASTNode ast) throws SemanticException {
+        String[] qualTabName =
+                HiveParserBaseSemanticAnalyzer.getQualifiedTableName(
+                        (HiveParserASTNode) ast.getChild(0));
+        ObjectPath tablePath = new ObjectPath(qualTabName[0], qualTabName[1]);
+        if (!isHive310OrLater()) {
+            // before hive3, Hive will check the table type is index table or not
+            Table table = getTable(tablePath);
+            if (table.getTableType().name().equals("INDEX_TABLE")) {
+                throw new SemanticException(
+                        String.format(
+                                "SHOW CREATE TABLE does not support tables of type INDEX_TABLE.. %s has has table type INDEX_TABLE.",
+                                tablePath));
+            }
+        }
+        return new HiveShowCreateTableOperation(tablePath);
+    }
+
+    private boolean isHive310OrLater() {
+        return HiveShimLoader.getHiveVersion().compareTo(HiveShimLoader.HIVE_VERSION_V3_1_0) >= 0;
     }
 
     private Operation convertAlterView(HiveParserASTNode ast) throws SemanticException {
@@ -836,14 +1055,15 @@ public class HiveParserDDLSemanticAnalyzer {
                 String[] dbTblName = dbDotTab.split("\\.");
                 Table destTable = new Table(Table.getEmptyTable(dbTblName[0], dbTblName[1]));
                 destTable.getSd().setCols(cols);
-                // create the insert operation
-                CatalogSinkModifyOperation insertOperation =
-                        dmlHelper.createInsertOperation(
-                                queryRelNode,
-                                destTable,
-                                Collections.emptyMap(),
-                                Collections.emptyList(),
-                                false);
+
+                Tuple4<ObjectIdentifier, QueryOperation, Map<String, String>, Boolean>
+                        insertOperationInfo =
+                                dmlHelper.createInsertOperationInfo(
+                                        queryRelNode,
+                                        destTable,
+                                        Collections.emptyMap(),
+                                        Collections.emptyList(),
+                                        false);
 
                 CreateTableOperation createTableOperation =
                         convertCreateTable(
@@ -861,7 +1081,11 @@ public class HiveParserDDLSemanticAnalyzer {
                                 primaryKeys,
                                 notNulls);
 
-                return new CreateTableASOperation(createTableOperation, insertOperation);
+                return new CreateTableASOperation(
+                        createTableOperation,
+                        insertOperationInfo.f2,
+                        insertOperationInfo.f1,
+                        insertOperationInfo.f3);
             default:
                 throw new ValidationException("Unrecognized command.");
         }
@@ -965,7 +1189,7 @@ public class HiveParserDDLSemanticAnalyzer {
         props.put(FactoryUtil.CONNECTOR.key(), SqlCreateHiveTable.IDENTIFIER);
     }
 
-    private void encodeRowFormat(
+    public static void encodeRowFormat(
             HiveParserRowFormatParams rowFormatParams, Map<String, String> props) {
         if (rowFormatParams.getFieldDelim() != null) {
             props.put(FIELD_DELIM, rowFormatParams.getFieldDelim());
@@ -987,7 +1211,7 @@ public class HiveParserDDLSemanticAnalyzer {
         }
     }
 
-    private void encodeStorageFormat(
+    public static void encodeStorageFormat(
             HiveParserStorageFormat storageFormat, Map<String, String> props) {
         String serdeName = storageFormat.getSerde();
         if (serdeName != null) {
@@ -1504,9 +1728,9 @@ public class HiveParserDDLSemanticAnalyzer {
             String key = partVal.getChild(0).getText();
             String val = null;
             if (partVal.getChildCount() == 3) {
-                val = HiveParserBaseSemanticAnalyzer.stripQuotes(partVal.getChild(2).getText());
+                val = stripQuotes(partVal.getChild(2).getText());
             } else if (partVal.getChildCount() == 2) {
-                val = HiveParserBaseSemanticAnalyzer.stripQuotes(partVal.getChild(1).getText());
+                val = stripQuotes(partVal.getChild(1).getText());
             }
             partSpec.put(key.toLowerCase(), val);
         }
@@ -1545,7 +1769,10 @@ public class HiveParserDDLSemanticAnalyzer {
         if (partSpec != null && !partSpec.isEmpty()) {
             spec = new CatalogPartitionSpec(new HashMap<>(partSpec));
         }
-        return new ShowPartitionsOperation(tableIdentifier, spec);
+        return new ShowPartitionsOperation(
+                tableIdentifier,
+                spec,
+                HiveConf.getVar(conf, HiveConf.ConfVars.DEFAULTPARTITIONNAME));
     }
 
     private Operation convertShowDatabases() {
@@ -1924,7 +2151,7 @@ public class HiveParserDDLSemanticAnalyzer {
 
     private CatalogBaseTable getCatalogBaseTable(
             ObjectIdentifier tableIdentifier, boolean ifExists) {
-        Optional<CatalogManager.TableLookupResult> optionalCatalogTable =
+        Optional<ContextResolvedTable> optionalCatalogTable =
                 catalogManager.getTable(tableIdentifier);
         if (!optionalCatalogTable.isPresent()) {
             if (ifExists) {

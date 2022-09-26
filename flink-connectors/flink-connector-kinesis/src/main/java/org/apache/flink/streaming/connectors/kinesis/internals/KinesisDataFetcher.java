@@ -20,6 +20,7 @@ package org.apache.flink.streaming.connectors.kinesis.internals;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
 import org.apache.flink.api.common.serialization.RuntimeContextInitializationContextAdapters;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
@@ -52,7 +53,6 @@ import org.apache.flink.streaming.connectors.kinesis.util.RecordEmitter;
 import org.apache.flink.streaming.connectors.kinesis.util.StreamConsumerRegistrarUtil;
 import org.apache.flink.streaming.connectors.kinesis.util.WatermarkTracker;
 import org.apache.flink.streaming.runtime.operators.windowing.TimestampedValue;
-import org.apache.flink.streaming.runtime.tasks.ProcessingTimeCallback;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.Preconditions;
@@ -819,7 +819,7 @@ public class KinesisDataFetcher<T> {
                 LOG.warn("Encountered exception closing record publisher factory", e);
             }
         } finally {
-            shardConsumersExecutor.shutdownNow();
+            gracefulShutdownShardConsumers();
 
             cancelFuture.complete(null);
 
@@ -850,6 +850,11 @@ public class KinesisDataFetcher<T> {
     @VisibleForTesting
     protected void deregisterStreamConsumer() {
         StreamConsumerRegistrarUtil.deregisterStreamConsumers(configProps, streams);
+    }
+
+    /** Gracefully stops shardConsumersExecutor without interrupting running threads. */
+    private void gracefulShutdownShardConsumers() {
+        shardConsumersExecutor.shutdown();
     }
 
     /**

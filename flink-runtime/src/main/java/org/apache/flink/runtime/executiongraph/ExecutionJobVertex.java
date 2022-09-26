@@ -42,6 +42,7 @@ import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroup;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
+import org.apache.flink.runtime.operators.coordination.CoordinatorStore;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinatorHolder;
 import org.apache.flink.runtime.scheduler.VertexParallelismInformation;
@@ -155,10 +156,11 @@ public class ExecutionJobVertex
     }
 
     protected void initialize(
-            int maxPriorAttemptsHistoryLength,
+            int executionHistorySizeLimit,
             Time timeout,
             long createTimestamp,
-            SubtaskAttemptNumberStore initialAttemptCounts)
+            SubtaskAttemptNumberStore initialAttemptCounts,
+            CoordinatorStore coordinatorStore)
             throws JobException {
 
         checkState(parallelismInfo.getParallelism() > 0);
@@ -177,7 +179,7 @@ public class ExecutionJobVertex
 
             this.producedDataSets[i] =
                     new IntermediateResult(
-                            result.getId(),
+                            result,
                             this,
                             this.parallelismInfo.getParallelism(),
                             result.getResultType());
@@ -186,13 +188,13 @@ public class ExecutionJobVertex
         // create all task vertices
         for (int i = 0; i < this.parallelismInfo.getParallelism(); i++) {
             ExecutionVertex vertex =
-                    new ExecutionVertex(
+                    createExecutionVertex(
                             this,
                             i,
                             producedDataSets,
                             timeout,
                             createTimestamp,
-                            maxPriorAttemptsHistoryLength,
+                            executionHistorySizeLimit,
                             initialAttemptCounts.getAttemptCount(i));
 
             this.taskVertices[i] = vertex;
@@ -218,8 +220,8 @@ public class ExecutionJobVertex
                 for (final SerializedValue<OperatorCoordinator.Provider> provider :
                         coordinatorProviders) {
                     coordinators.add(
-                            OperatorCoordinatorHolder.create(
-                                    provider, this, graph.getUserClassLoader()));
+                            createOperatorCoordinatorHolder(
+                                    provider, graph.getUserClassLoader(), coordinatorStore));
                 }
             } catch (Exception | LinkageError e) {
                 IOUtils.closeAllQuietly(coordinators);
@@ -256,6 +258,33 @@ public class ExecutionJobVertex
             throw new JobException(
                     "Creating the input splits caused an error: " + t.getMessage(), t);
         }
+    }
+
+    protected ExecutionVertex createExecutionVertex(
+            ExecutionJobVertex jobVertex,
+            int subTaskIndex,
+            IntermediateResult[] producedDataSets,
+            Time timeout,
+            long createTimestamp,
+            int executionHistorySizeLimit,
+            int initialAttemptCount) {
+        return new ExecutionVertex(
+                jobVertex,
+                subTaskIndex,
+                producedDataSets,
+                timeout,
+                createTimestamp,
+                executionHistorySizeLimit,
+                initialAttemptCount);
+    }
+
+    protected OperatorCoordinatorHolder createOperatorCoordinatorHolder(
+            SerializedValue<OperatorCoordinator.Provider> provider,
+            ClassLoader classLoader,
+            CoordinatorStore coordinatorStore)
+            throws Exception {
+        return OperatorCoordinatorHolder.create(
+                provider, this, classLoader, coordinatorStore, false);
     }
 
     public boolean isInitialized() {
@@ -514,6 +543,11 @@ public class ExecutionJobVertex
         numExecutionVertexFinished--;
     }
 
+    public boolean isFinished() {
+        return isParallelismDecided()
+                && numExecutionVertexFinished == parallelismInfo.getParallelism();
+    }
+
     // --------------------------------------------------------------------------------------------
     //  Accumulators / Metrics
     // --------------------------------------------------------------------------------------------
@@ -587,6 +621,17 @@ public class ExecutionJobVertex
         } else {
             // all else collapses under created
             return ExecutionState.CREATED;
+        }
+    }
+
+    /** Factory to create {@link ExecutionJobVertex}. */
+    public static class Factory {
+        ExecutionJobVertex createExecutionJobVertex(
+                InternalExecutionGraphAccessor graph,
+                JobVertex jobVertex,
+                VertexParallelismInformation parallelismInfo)
+                throws JobException {
+            return new ExecutionJobVertex(graph, jobVertex, parallelismInfo);
         }
     }
 }

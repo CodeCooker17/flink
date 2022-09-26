@@ -49,6 +49,7 @@ import org.apache.flink.streaming.api.operators.sorted.state.BatchExecutionCheck
 import org.apache.flink.streaming.api.operators.sorted.state.BatchExecutionInternalTimeServiceManager;
 import org.apache.flink.streaming.api.operators.sorted.state.BatchExecutionStateBackend;
 import org.apache.flink.streaming.api.transformations.BroadcastStateTransformation;
+import org.apache.flink.streaming.api.transformations.CacheTransformation;
 import org.apache.flink.streaming.api.transformations.CoFeedbackTransformation;
 import org.apache.flink.streaming.api.transformations.FeedbackTransformation;
 import org.apache.flink.streaming.api.transformations.KeyedBroadcastStateTransformation;
@@ -69,6 +70,7 @@ import org.apache.flink.streaming.api.transformations.UnionTransformation;
 import org.apache.flink.streaming.api.transformations.WithBoundedness;
 import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 import org.apache.flink.streaming.runtime.translators.BroadcastStateTransformationTranslator;
+import org.apache.flink.streaming.runtime.translators.CacheTransformationTranslator;
 import org.apache.flink.streaming.runtime.translators.KeyedBroadcastStateTransformationTranslator;
 import org.apache.flink.streaming.runtime.translators.LegacySinkTransformationTranslator;
 import org.apache.flink.streaming.runtime.translators.LegacySourceTransformationTranslator;
@@ -93,6 +95,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -204,6 +207,7 @@ public class StreamGraphGenerator {
         tmp.put(
                 KeyedBroadcastStateTransformation.class,
                 new KeyedBroadcastStateTransformationTranslator<>());
+        tmp.put(CacheTransformation.class, new CacheTransformationTranslator<>());
         translatorMap = Collections.unmodifiableMap(tmp);
     }
 
@@ -309,7 +313,7 @@ public class StreamGraphGenerator {
         shouldExecuteInBatchMode = shouldExecuteInBatchMode();
         configureStreamGraph(streamGraph);
 
-        alreadyTransformed = new HashMap<>();
+        alreadyTransformed = new IdentityHashMap<>();
 
         for (Transformation<?> transformation : transformations) {
             transform(transformation);
@@ -347,6 +351,9 @@ public class StreamGraphGenerator {
         graph.setChaining(chaining);
         graph.setUserArtifacts(userArtifacts);
         graph.setTimeCharacteristic(timeCharacteristic);
+        graph.setVertexDescriptionMode(configuration.get(PipelineOptions.VERTEX_DESCRIPTION_MODE));
+        graph.setVertexNameIncludeIndexPrefix(
+                configuration.get(PipelineOptions.VERTEX_NAME_INCLUDE_INDEX_PREFIX));
 
         if (shouldExecuteInBatchMode) {
             configureStreamGraphBatch(graph);
@@ -393,6 +400,10 @@ public class StreamGraphGenerator {
                 return GlobalStreamExchangeMode.ALL_EDGES_PIPELINED;
             case ALL_EXCHANGES_BLOCKING:
                 return GlobalStreamExchangeMode.ALL_EDGES_BLOCKING;
+            case ALL_EXCHANGES_HYBRID_FULL:
+                return GlobalStreamExchangeMode.ALL_EDGES_HYBRID_FULL;
+            case ALL_EXCHANGES_HYBRID_SELECTIVE:
+                return GlobalStreamExchangeMode.ALL_EDGES_HYBRID_SELECTIVE;
             default:
                 throw new IllegalArgumentException(
                         String.format(
@@ -922,6 +933,11 @@ public class StreamGraphGenerator {
         @Override
         public ReadableConfig getGraphGeneratorConfig() {
             return config;
+        }
+
+        @Override
+        public Collection<Integer> transform(Transformation<?> transformation) {
+            return streamGraphGenerator.transform(transformation);
         }
     }
 }

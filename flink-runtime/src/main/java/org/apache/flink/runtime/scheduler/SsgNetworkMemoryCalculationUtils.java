@@ -18,11 +18,16 @@
 
 package org.apache.flink.runtime.scheduler;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.deployment.SubpartitionIndexRange;
+import org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory;
 import org.apache.flink.runtime.executiongraph.EdgeManagerBuildUtil;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
+import org.apache.flink.runtime.executiongraph.ExecutionVertex;
 import org.apache.flink.runtime.executiongraph.IntermediateResult;
+import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSet;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
@@ -30,15 +35,16 @@ import org.apache.flink.runtime.jobgraph.JobEdge;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
+import org.apache.flink.runtime.scheduler.strategy.ConsumedPartitionGroup;
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 import org.apache.flink.runtime.shuffle.TaskInputsOutputsDescriptor;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
-import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
@@ -51,7 +57,7 @@ public class SsgNetworkMemoryCalculationUtils {
      * Calculates network memory requirement of {@link ExecutionJobVertex} and update {@link
      * ResourceProfile} of corresponding slot sharing group.
      */
-    static void enrichNetworkMemory(
+    public static void enrichNetworkMemory(
             SlotSharingGroup ssg,
             Function<JobVertexID, ExecutionJobVertex> ejvs,
             ShuffleMaster<?> shuffleMaster) {
@@ -88,13 +94,22 @@ public class SsgNetworkMemoryCalculationUtils {
     private static TaskInputsOutputsDescriptor buildTaskInputsOutputsDescriptor(
             ExecutionJobVertex ejv, Function<JobVertexID, ExecutionJobVertex> ejvs) {
 
-        Map<IntermediateDataSetID, Integer> maxInputChannelNums = getMaxInputChannelNums(ejv);
-        Map<IntermediateDataSetID, Integer> maxSubpartitionNums = getMaxSubpartitionNums(ejv, ejvs);
+        Map<IntermediateDataSetID, Integer> maxInputChannelNums;
+        Map<IntermediateDataSetID, Integer> maxSubpartitionNums;
+
+        if (ejv.getGraph().isDynamic()) {
+            maxInputChannelNums = getMaxInputChannelNumsForDynamicGraph(ejv);
+            maxSubpartitionNums = getMaxSubpartitionNumsForDynamicGraph(ejv);
+        } else {
+            maxInputChannelNums = getMaxInputChannelNums(ejv);
+            maxSubpartitionNums = getMaxSubpartitionNums(ejv, ejvs);
+        }
+
         JobVertex jv = ejv.getJobVertex();
         Map<IntermediateDataSetID, ResultPartitionType> partitionTypes = getPartitionTypes(jv);
 
         return TaskInputsOutputsDescriptor.from(
-                maxInputChannelNums, maxSubpartitionNums, partitionTypes);
+                jv.getNumberOfInputs(), maxInputChannelNums, maxSubpartitionNums, partitionTypes);
     }
 
     private static Map<IntermediateDataSetID, Integer> getMaxInputChannelNums(
@@ -115,7 +130,7 @@ public class SsgNetworkMemoryCalculationUtils {
                             ejv.getParallelism(),
                             consumedResult.getNumberOfAssignedPartitions(),
                             inputEdge.getDistributionPattern());
-            ret.put(consumedResult.getId(), maxNum);
+            ret.merge(consumedResult.getId(), maxNum, Integer::sum);
         }
 
         return ret;
@@ -127,15 +142,22 @@ public class SsgNetworkMemoryCalculationUtils {
         Map<IntermediateDataSetID, Integer> ret = new HashMap<>();
         List<IntermediateDataSet> producedDataSets = ejv.getJobVertex().getProducedDataSets();
 
-        for (int i = 0; i < producedDataSets.size(); i++) {
-            IntermediateDataSet producedDataSet = producedDataSets.get(i);
-            JobEdge outputEdge = checkNotNull(producedDataSet.getConsumer());
-            ExecutionJobVertex consumerJobVertex = ejvs.apply(outputEdge.getTarget().getID());
-            int maxNum =
-                    EdgeManagerBuildUtil.computeMaxEdgesToTargetExecutionVertex(
-                            ejv.getParallelism(),
-                            consumerJobVertex.getParallelism(),
-                            outputEdge.getDistributionPattern());
+        checkState(!ejv.getGraph().isDynamic(), "Only support non-dynamic graph.");
+        for (IntermediateDataSet producedDataSet : producedDataSets) {
+            int maxNum = 0;
+            List<JobEdge> outputEdges = producedDataSet.getConsumers();
+
+            if (!outputEdges.isEmpty()) {
+                // for non-dynamic graph, the consumer vertices' parallelisms and distribution
+                // patterns must be the same
+                JobEdge outputEdge = outputEdges.get(0);
+                ExecutionJobVertex consumerJobVertex = ejvs.apply(outputEdge.getTarget().getID());
+                maxNum =
+                        EdgeManagerBuildUtil.computeMaxEdgesToTargetExecutionVertex(
+                                ejv.getParallelism(),
+                                consumerJobVertex.getParallelism(),
+                                outputEdge.getDistributionPattern());
+            }
             ret.put(producedDataSet.getId(), maxNum);
         }
 
@@ -145,6 +167,55 @@ public class SsgNetworkMemoryCalculationUtils {
     private static Map<IntermediateDataSetID, ResultPartitionType> getPartitionTypes(JobVertex jv) {
         Map<IntermediateDataSetID, ResultPartitionType> ret = new HashMap<>();
         jv.getProducedDataSets().forEach(ds -> ret.putIfAbsent(ds.getId(), ds.getResultType()));
+        return ret;
+    }
+
+    @VisibleForTesting
+    static Map<IntermediateDataSetID, Integer> getMaxInputChannelNumsForDynamicGraph(
+            ExecutionJobVertex ejv) {
+
+        Map<IntermediateDataSetID, Integer> ret = new HashMap<>();
+
+        for (ExecutionVertex vertex : ejv.getTaskVertices()) {
+            Map<IntermediateDataSetID, Integer> tmp = new HashMap<>();
+
+            for (ConsumedPartitionGroup partitionGroup : vertex.getAllConsumedPartitionGroups()) {
+
+                IntermediateResultPartition resultPartition =
+                        ejv.getGraph().getResultPartitionOrThrow((partitionGroup.getFirst()));
+                SubpartitionIndexRange subpartitionIndexRange =
+                        TaskDeploymentDescriptorFactory.computeConsumedSubpartitionRange(
+                                partitionGroup.getNumConsumers(),
+                                resultPartition,
+                                vertex.getParallelSubtaskIndex());
+
+                tmp.merge(
+                        partitionGroup.getIntermediateDataSetID(),
+                        subpartitionIndexRange.size() * partitionGroup.size(),
+                        Integer::sum);
+            }
+
+            for (Map.Entry<IntermediateDataSetID, Integer> entry : tmp.entrySet()) {
+                ret.merge(entry.getKey(), entry.getValue(), Integer::max);
+            }
+        }
+
+        return ret;
+    }
+
+    private static Map<IntermediateDataSetID, Integer> getMaxSubpartitionNumsForDynamicGraph(
+            ExecutionJobVertex ejv) {
+
+        Map<IntermediateDataSetID, Integer> ret = new HashMap<>();
+
+        for (IntermediateResult intermediateResult : ejv.getProducedDataSets()) {
+            final int maxNum =
+                    Arrays.stream(intermediateResult.getPartitions())
+                            .map(IntermediateResultPartition::getNumberOfSubpartitions)
+                            .reduce(0, Integer::max);
+            ret.put(intermediateResult.getId(), maxNum);
+        }
+
         return ret;
     }
 

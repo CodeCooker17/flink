@@ -19,9 +19,9 @@
 package org.apache.flink.connector.pulsar.source.reader.source;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceReaderContext;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.pulsar.source.config.SourceConfiguration;
@@ -61,7 +61,7 @@ import java.util.function.Supplier;
 public class PulsarOrderedSourceReader<OUT> extends PulsarSourceReaderBase<OUT> {
     private static final Logger LOG = LoggerFactory.getLogger(PulsarOrderedSourceReader.class);
 
-    private final SortedMap<Long, Map<TopicPartition, MessageId>> cursorsToCommit;
+    @VisibleForTesting final SortedMap<Long, Map<TopicPartition, MessageId>> cursorsToCommit;
     private final ConcurrentMap<TopicPartition, MessageId> cursorsOfFinishedSplits;
     private final AtomicReference<Throwable> cursorCommitThrowable = new AtomicReference<>();
     private ScheduledExecutorService cursorScheduler;
@@ -69,15 +69,14 @@ public class PulsarOrderedSourceReader<OUT> extends PulsarSourceReaderBase<OUT> 
     public PulsarOrderedSourceReader(
             FutureCompletingBlockingQueue<RecordsWithSplitIds<PulsarMessage<OUT>>> elementsQueue,
             Supplier<PulsarOrderedPartitionSplitReader<OUT>> splitReaderSupplier,
-            Configuration configuration,
             SourceReaderContext context,
             SourceConfiguration sourceConfiguration,
             PulsarClient pulsarClient,
             PulsarAdmin pulsarAdmin) {
         super(
                 elementsQueue,
-                new PulsarOrderedFetcherManager<>(elementsQueue, splitReaderSupplier::get),
-                configuration,
+                new PulsarOrderedFetcherManager<>(
+                        elementsQueue, splitReaderSupplier::get, context.getConfiguration()),
                 context,
                 sourceConfiguration,
                 pulsarClient,
@@ -145,7 +144,7 @@ public class PulsarOrderedSourceReader<OUT> extends PulsarSourceReaderBase<OUT> 
     }
 
     @Override
-    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+    public void notifyCheckpointComplete(long checkpointId) {
         LOG.debug("Committing cursors for checkpoint {}", checkpointId);
         Map<TopicPartition, MessageId> cursors = cursorsToCommit.get(checkpointId);
         try {

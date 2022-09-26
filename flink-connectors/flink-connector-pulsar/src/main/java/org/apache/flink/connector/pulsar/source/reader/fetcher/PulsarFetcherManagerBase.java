@@ -19,10 +19,11 @@
 package org.apache.flink.connector.pulsar.source.reader.fetcher;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.SourceReaderBase;
-import org.apache.flink.connector.base.source.reader.fetcher.SingleThreadFetcherManager;
 import org.apache.flink.connector.base.source.reader.fetcher.SplitFetcher;
+import org.apache.flink.connector.base.source.reader.fetcher.SplitFetcherManager;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.pulsar.source.reader.message.PulsarMessage;
@@ -42,7 +43,7 @@ import static java.util.Collections.singletonList;
  */
 @Internal
 public abstract class PulsarFetcherManagerBase<T>
-        extends SingleThreadFetcherManager<PulsarMessage<T>, PulsarPartitionSplit> {
+        extends SplitFetcherManager<PulsarMessage<T>, PulsarPartitionSplit> {
 
     private final Map<String, Integer> splitFetcherMapping = new HashMap<>();
     private final Map<Integer, Boolean> fetcherStatus = new HashMap<>();
@@ -57,8 +58,9 @@ public abstract class PulsarFetcherManagerBase<T>
      */
     protected PulsarFetcherManagerBase(
             FutureCompletingBlockingQueue<RecordsWithSplitIds<PulsarMessage<T>>> elementsQueue,
-            Supplier<SplitReader<PulsarMessage<T>, PulsarPartitionSplit>> splitReaderSupplier) {
-        super(elementsQueue, splitReaderSupplier);
+            Supplier<SplitReader<PulsarMessage<T>, PulsarPartitionSplit>> splitReaderSupplier,
+            Configuration configuration) {
+        super(elementsQueue, splitReaderSupplier, configuration);
     }
 
     /**

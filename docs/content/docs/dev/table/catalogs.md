@@ -46,7 +46,7 @@ The `GenericInMemoryCatalog` is an in-memory implementation of a catalog. All ob
 
 ### JdbcCatalog
 
-The `JdbcCatalog` enables users to connect Flink to relational databases over JDBC protocol. `PostgresCatalog` is the only implementation of JDBC Catalog at the moment.
+The `JdbcCatalog` enables users to connect Flink to relational databases over JDBC protocol. Postgres Catalog and MySQL Catalog are the only two implementations of JDBC Catalog at the moment.
 See [JdbcCatalog documentation]({{< ref "docs/connectors/table/jdbc" >}}) for more details on setting up the catalog.
 
 ### HiveCatalog
@@ -67,6 +67,10 @@ The factory is discovered using Java's Service Provider Interfaces (SPI).
 Classes that implement this interface can be added to  `META_INF/services/org.apache.flink.table.factories.Factory` in JAR files.
 The provided factory identifier will be used for matching against the required `type` property in a SQL `CREATE CATALOG` DDL statement.
 
+{{< hint warning >}}Since Flink v1.16, TableEnvironment introduces a user class loader to have a consistent class loading behavior in table programs, SQL Client and SQL Gateway. The user classloader manages all user jars such as jar added by `ADD JAR` or `CREATE FUNCTION .. USING JAR ..` statements.
+User-defined catalogs should replace `Thread.currentThread().getContextClassLoader()` with the user class loader to load classes. Otherwise, `ClassNotFoundException` maybe thrown. The user class loader can be accessed via `CatalogFactory.Context#getClassLoader`.
+{{< /hint >}}
+
 ## How to Create and Register Flink Tables to Catalog
 
 ### Using SQL DDL
@@ -76,7 +80,7 @@ Users can use SQL DDL to create tables in catalogs in both Table API and SQL.
 {{< tabs "b462513f-2da9-4bd0-a55d-ca9a5e4cf512" >}}
 {{< tab "Java" >}}
 ```java
-TableEnvironment tableEnv = ...
+TableEnvironment tableEnv = ...;
 
 // Create a HiveCatalog 
 Catalog catalog = new HiveCatalog("myhive", null, "<path_of_hive_conf>");
@@ -245,7 +249,7 @@ schema = Schema.new_builder() \
     
 catalog_table = t_env.create_table("myhive.mydb.mytable", TableDescriptor.for_connector("kafka")
     .schema(schema)
-    // …
+    # …
     .build())
 
 # tables should contain "mytable"

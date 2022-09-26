@@ -18,11 +18,12 @@
 package org.apache.flink.streaming.connectors.kinesis.proxy;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.connector.aws.util.AWSAsyncSinkUtil;
 import org.apache.flink.connector.aws.util.AWSGeneralUtil;
-import org.apache.flink.connector.kinesis.config.AWSKinesisDataStreamsConfigConstants;
-import org.apache.flink.connector.kinesis.util.AWSKinesisDataStreamsUtil;
+import org.apache.flink.connector.kinesis.sink.KinesisStreamsConfigConstants;
 import org.apache.flink.streaming.connectors.kinesis.internals.publisher.fanout.FanOutRecordPublisherConfiguration;
 import org.apache.flink.streaming.connectors.kinesis.util.AwsV2Util;
+import org.apache.flink.streaming.connectors.kinesis.util.KinesisConfigUtil;
 import org.apache.flink.util.Preconditions;
 
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
@@ -61,15 +62,16 @@ public class KinesisProxyV2Factory {
         final FanOutRecordPublisherConfiguration configuration =
                 new FanOutRecordPublisherConfiguration(configProps, emptyList());
 
-        Properties legacyConfigProps = new Properties(configProps);
-        legacyConfigProps.setProperty(
-                AWSKinesisDataStreamsConfigConstants.KINESIS_CLIENT_USER_AGENT_PREFIX,
-                AWSKinesisDataStreamsUtil.formatFlinkUserAgentPrefix(
-                        AWSKinesisDataStreamsConfigConstants
-                                .BASE_KINESIS_USER_AGENT_PREFIX_FORMAT));
+        Properties asyncClientProperties =
+                KinesisConfigUtil.getV2ConsumerAsyncClientProperties(configProps);
 
         final KinesisAsyncClient client =
-                AWSKinesisDataStreamsUtil.createKinesisAsyncClient(legacyConfigProps, httpClient);
+                AWSAsyncSinkUtil.createAwsAsyncClient(
+                        asyncClientProperties,
+                        httpClient,
+                        KinesisAsyncClient.builder(),
+                        KinesisStreamsConfigConstants.BASE_KINESIS_USER_AGENT_PREFIX_FORMAT,
+                        KinesisStreamsConfigConstants.KINESIS_CLIENT_USER_AGENT_PREFIX);
 
         return new KinesisProxyV2(client, httpClient, configuration, BACKOFF);
     }

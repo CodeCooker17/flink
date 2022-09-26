@@ -18,6 +18,7 @@
 
 package org.apache.flink.metrics.groups;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.metrics.CharacterFilter;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Gauge;
@@ -33,6 +34,7 @@ import java.util.Map;
  * A special {@link MetricGroup} that does not register any metrics at the metrics registry and any
  * reporters.
  */
+@Internal
 public class UnregisteredMetricsGroup implements MetricGroup {
 
     @Override
@@ -106,6 +108,10 @@ public class UnregisteredMetricsGroup implements MetricGroup {
         return new UnregisteredSplitEnumeratorMetricGroup();
     }
 
+    public static CacheMetricGroup createCacheMetricGroup() {
+        return new UnregisteredCacheMetricGroup();
+    }
+
     private static class UnregisteredOperatorMetricGroup extends UnregisteredMetricsGroup
             implements OperatorMetricGroup {
         @Override
@@ -175,5 +181,29 @@ public class UnregisteredMetricsGroup implements MetricGroup {
         public <G extends Gauge<Long>> G setUnassignedSplitsGauge(G unassignedSplitsGauge) {
             return null;
         }
+    }
+
+    private static class UnregisteredCacheMetricGroup extends UnregisteredMetricsGroup
+            implements CacheMetricGroup {
+        @Override
+        public void hitCounter(Counter hitCounter) {}
+
+        @Override
+        public void missCounter(Counter missCounter) {}
+
+        @Override
+        public void loadCounter(Counter loadCounter) {}
+
+        @Override
+        public void numLoadFailuresCounter(Counter numLoadFailuresCounter) {}
+
+        @Override
+        public void latestLoadTimeGauge(Gauge<Long> latestLoadTimeGauge) {}
+
+        @Override
+        public void numCachedRecordsGauge(Gauge<Long> numCachedRecordsGauge) {}
+
+        @Override
+        public void numCachedBytesGauge(Gauge<Long> numCachedBytesGauge) {}
     }
 }
