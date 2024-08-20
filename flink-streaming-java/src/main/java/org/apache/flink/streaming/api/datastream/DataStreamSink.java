@@ -22,10 +22,12 @@ import org.apache.flink.annotation.Public;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.api.common.operators.ResourceSpec;
 import org.apache.flink.api.common.operators.SlotSharingGroup;
+import org.apache.flink.api.common.operators.util.OperatorValidationUtils;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.lineage.LineageVertexProvider;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.StreamSink;
 import org.apache.flink.streaming.api.transformations.LegacySinkTransformation;
@@ -54,12 +56,18 @@ public class DataStreamSink<T> {
         StreamSink<T> sinkOperator = new StreamSink<>(sinkFunction);
         final StreamExecutionEnvironment executionEnvironment =
                 inputStream.getExecutionEnvironment();
-        PhysicalTransformation<T> transformation =
+        LegacySinkTransformation<T> transformation =
                 new LegacySinkTransformation<>(
                         inputStream.getTransformation(),
                         "Unnamed",
                         sinkOperator,
-                        executionEnvironment.getParallelism());
+                        executionEnvironment.getParallelism(),
+                        false);
+        if (sinkFunction instanceof LineageVertexProvider) {
+            transformation.setLineageVertex(
+                    ((LineageVertexProvider) sinkFunction).getLineageVertex());
+        }
+
         executionEnvironment.addOperator(transformation);
         return new DataStreamSink<>(transformation);
     }
@@ -78,7 +86,12 @@ public class DataStreamSink<T> {
                         inputStream.getType(),
                         "Sink",
                         executionEnvironment.getParallelism(),
+                        false,
                         customSinkOperatorUidHashes);
+        if (sink instanceof LineageVertexProvider) {
+            transformation.setLineageVertex(((LineageVertexProvider) sink).getLineageVertex());
+        }
+
         executionEnvironment.addOperator(transformation);
         return new DataStreamSink<>(transformation);
     }
@@ -175,6 +188,21 @@ public class DataStreamSink<T> {
      */
     public DataStreamSink<T> setParallelism(int parallelism) {
         transformation.setParallelism(parallelism);
+        return this;
+    }
+
+    /**
+     * Sets the max parallelism for this sink.
+     *
+     * <p>The maximum parallelism specifies the upper bound for dynamic scaling. The degree must be
+     * higher than zero and less than the upper bound.
+     *
+     * @param maxParallelism The max parallelism for this sink.
+     * @return The sink with set parallelism.
+     */
+    public DataStreamSink<T> setMaxParallelism(int maxParallelism) {
+        OperatorValidationUtils.validateMaxParallelism(maxParallelism, true);
+        transformation.setMaxParallelism(maxParallelism);
         return this;
     }
 

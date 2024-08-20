@@ -25,12 +25,18 @@ import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataInputViewStreamWrapper;
 import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
+import org.apache.flink.streaming.api.lineage.DefaultLineageDataset;
+import org.apache.flink.streaming.api.lineage.LineageDataset;
+import org.apache.flink.streaming.api.lineage.LineageVertex;
+import org.apache.flink.streaming.api.lineage.LineageVertexProvider;
+import org.apache.flink.streaming.api.lineage.SourceLineageVertex;
 import org.apache.flink.streaming.api.operators.OutputTypeConfigurable;
 import org.apache.flink.util.IterableUtils;
 import org.apache.flink.util.Preconditions;
@@ -44,6 +50,8 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 
@@ -57,11 +65,18 @@ import java.util.Objects;
  * <p><b>NOTE:</b> This source has a parallelism of 1.
  *
  * @param <T> The type of elements returned by this function.
+ * @deprecated This class is based on the {@link
+ *     org.apache.flink.streaming.api.functions.source.SourceFunction} API, which is due to be
+ *     removed. Use the new {@link org.apache.flink.api.connector.source.Source} API instead.
  */
+@Deprecated
 @PublicEvolving
 public class FromElementsFunction<T>
-        implements SourceFunction<T>, CheckpointedFunction, OutputTypeConfigurable<T> {
-
+        implements SourceFunction<T>,
+                CheckpointedFunction,
+                OutputTypeConfigurable<T>,
+                LineageVertexProvider {
+    private static final String LINEAGE_NAMESPACE = "values://FromElementsFunction";
     private static final long serialVersionUID = 1L;
 
     /** The (de)serializer to be used for the data elements. */
@@ -147,7 +162,8 @@ public class FromElementsFunction<T>
                 elements != null,
                 "The output type should've been specified before shipping the graph to the cluster");
         checkIterable(elements, outTypeInfo.getTypeClass());
-        TypeSerializer<T> newSerializer = outTypeInfo.createSerializer(executionConfig);
+        TypeSerializer<T> newSerializer =
+                outTypeInfo.createSerializer(executionConfig.getSerializerConfig());
         if (Objects.equals(serializer, newSerializer)) {
             return;
         }
@@ -267,8 +283,7 @@ public class FromElementsFunction<T>
                 this.checkpointedState != null,
                 "The " + getClass().getSimpleName() + " has not been properly initialized.");
 
-        this.checkpointedState.clear();
-        this.checkpointedState.add(this.numElementsEmitted);
+        this.checkpointedState.update(Collections.singletonList(this.numElementsEmitted));
     }
 
     // ------------------------------------------------------------------------
@@ -299,5 +314,21 @@ public class FromElementsFunction<T>
                                 + viewedAs.getCanonicalName());
             }
         }
+    }
+
+    @Override
+    public LineageVertex getLineageVertex() {
+        return new SourceLineageVertex() {
+            @Override
+            public Boundedness boundedness() {
+                return Boundedness.BOUNDED;
+            }
+
+            @Override
+            public List<LineageDataset> datasets() {
+                return Arrays.asList(
+                        new DefaultLineageDataset("", LINEAGE_NAMESPACE, new HashMap<>()));
+            }
+        };
     }
 }

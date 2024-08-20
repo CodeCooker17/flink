@@ -32,11 +32,11 @@ import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.typeutils.MissingTypeInfo;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.PipelineOptions;
-import org.apache.flink.core.fs.Path;
+import org.apache.flink.core.execution.JobStatusHook;
 import org.apache.flink.core.memory.ManagedMemoryUseCase;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
-import org.apache.flink.runtime.executiongraph.JobStatusHook;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobType;
@@ -46,11 +46,13 @@ import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.streaming.api.lineage.LineageGraph;
 import org.apache.flink.streaming.api.operators.InternalTimeServiceManager;
 import org.apache.flink.streaming.api.operators.OutputFormatOperatorFactory;
 import org.apache.flink.streaming.api.operators.SourceOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.api.transformations.StreamExchangeMode;
+import org.apache.flink.streaming.runtime.partitioner.ForwardForConsecutiveHashPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.ForwardForUnspecifiedPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.ForwardPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.RebalancePartitioner;
@@ -63,7 +65,6 @@ import org.apache.flink.streaming.runtime.tasks.StreamIterationHead;
 import org.apache.flink.streaming.runtime.tasks.StreamIterationTail;
 import org.apache.flink.streaming.runtime.tasks.TwoInputStreamTask;
 import org.apache.flink.util.OutputTag;
-import org.apache.flink.util.TernaryBoolean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,7 +73,6 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -97,14 +97,10 @@ public class StreamGraph implements Pipeline {
 
     private String jobName;
 
+    private final Configuration jobConfiguration;
     private final ExecutionConfig executionConfig;
     private final CheckpointConfig checkpointConfig;
     private SavepointRestoreSettings savepointRestoreSettings = SavepointRestoreSettings.none();
-
-    private boolean chaining;
-
-    private Collection<Tuple2<String, DistributedCache.DistributedCacheEntry>> userArtifacts =
-            Collections.emptyList();
 
     private TimeCharacteristic timeCharacteristic;
 
@@ -118,7 +114,6 @@ public class StreamGraph implements Pipeline {
     private Map<Integer, StreamNode> streamNodes;
     private Set<Integer> sources;
     private Set<Integer> sinks;
-    private Set<Integer> expandedSinks;
     private Map<Integer, Tuple2<Integer, OutputTag>> virtualSideOutputNodes;
     private Map<Integer, Tuple3<Integer, StreamPartitioner<?>, StreamExchangeMode>>
             virtualPartitionNodes;
@@ -126,11 +121,10 @@ public class StreamGraph implements Pipeline {
     protected Map<Integer, String> vertexIDtoBrokerID;
     protected Map<Integer, Long> vertexIDtoLoopTimeout;
     private StateBackend stateBackend;
-    private TernaryBoolean changelogStateBackendEnabled;
     private CheckpointStorage checkpointStorage;
-    private Path savepointDir;
     private Set<Tuple2<StreamNode, StreamNode>> iterationSourceSinkPairs;
     private InternalTimeServiceManager.Provider timerServiceProvider;
+    private LineageGraph lineageGraph;
     private JobType jobType = JobType.STREAMING;
     private Map<String, ResourceProfile> slotSharingGroupResources;
     private PipelineOptions.VertexDescriptionMode descriptionMode =
@@ -139,10 +133,19 @@ public class StreamGraph implements Pipeline {
 
     private final List<JobStatusHook> jobStatusHooks = new ArrayList<>();
 
+    private boolean dynamic;
+
+    private boolean autoParallelismEnabled;
+
+    private final transient Map<StreamNode, StreamOperatorFactory<?>> nodeToHeadOperatorCache =
+            new HashMap<>();
+
     public StreamGraph(
+            Configuration jobConfiguration,
             ExecutionConfig executionConfig,
             CheckpointConfig checkpointConfig,
             SavepointRestoreSettings savepointRestoreSettings) {
+        this.jobConfiguration = new Configuration(checkNotNull(jobConfiguration));
         this.executionConfig = checkNotNull(executionConfig);
         this.checkpointConfig = checkNotNull(checkpointConfig);
         this.savepointRestoreSettings = checkNotNull(savepointRestoreSettings);
@@ -161,7 +164,6 @@ public class StreamGraph implements Pipeline {
         iterationSourceSinkPairs = new HashSet<>();
         sources = new HashSet<>();
         sinks = new HashSet<>();
-        expandedSinks = new HashSet<>();
         slotSharingGroupResources = new HashMap<>();
     }
 
@@ -169,8 +171,20 @@ public class StreamGraph implements Pipeline {
         return executionConfig;
     }
 
+    public Configuration getJobConfiguration() {
+        return jobConfiguration;
+    }
+
     public CheckpointConfig getCheckpointConfig() {
         return checkpointConfig;
+    }
+
+    void cacheHeadOperatorForNode(StreamNode node, StreamOperatorFactory<?> headOperator) {
+        nodeToHeadOperatorCache.put(node, headOperator);
+    }
+
+    StreamOperatorFactory<?> getHeadOperatorForNodeFromCache(StreamNode node) {
+        return nodeToHeadOperatorCache.get(node);
     }
 
     public void setSavepointRestoreSettings(SavepointRestoreSettings savepointRestoreSettings) {
@@ -189,8 +203,12 @@ public class StreamGraph implements Pipeline {
         this.jobName = jobName;
     }
 
-    public void setChaining(boolean chaining) {
-        this.chaining = chaining;
+    public LineageGraph getLineageGraph() {
+        return lineageGraph;
+    }
+
+    public void setLineageGraph(LineageGraph lineageGraph) {
+        this.lineageGraph = lineageGraph;
     }
 
     public void setStateBackend(StateBackend backend) {
@@ -201,28 +219,12 @@ public class StreamGraph implements Pipeline {
         return this.stateBackend;
     }
 
-    public void setChangelogStateBackendEnabled(TernaryBoolean changelogStateBackendEnabled) {
-        this.changelogStateBackendEnabled = changelogStateBackendEnabled;
-    }
-
-    public TernaryBoolean isChangelogStateBackendEnabled() {
-        return changelogStateBackendEnabled;
-    }
-
     public void setCheckpointStorage(CheckpointStorage checkpointStorage) {
         this.checkpointStorage = checkpointStorage;
     }
 
     public CheckpointStorage getCheckpointStorage() {
         return this.checkpointStorage;
-    }
-
-    public void setSavepointDirectory(Path savepointDir) {
-        this.savepointDir = savepointDir;
-    }
-
-    public Path getSavepointDirectory() {
-        return this.savepointDir;
     }
 
     public InternalTimeServiceManager.Provider getTimerServiceProvider() {
@@ -234,12 +236,9 @@ public class StreamGraph implements Pipeline {
     }
 
     public Collection<Tuple2<String, DistributedCache.DistributedCacheEntry>> getUserArtifacts() {
-        return userArtifacts;
-    }
-
-    public void setUserArtifacts(
-            Collection<Tuple2<String, DistributedCache.DistributedCacheEntry>> userArtifacts) {
-        this.userArtifacts = checkNotNull(userArtifacts);
+        return Optional.ofNullable(jobConfiguration.get(PipelineOptions.CACHED_FILES))
+                .map(DistributedCache::parseCachedFilesFromString)
+                .orElse(new ArrayList<>());
     }
 
     public TimeCharacteristic getTimeCharacteristic() {
@@ -304,7 +303,12 @@ public class StreamGraph implements Pipeline {
     // Checkpointing
 
     public boolean isChainingEnabled() {
-        return chaining;
+        return jobConfiguration.get(PipelineOptions.OPERATOR_CHAINING);
+    }
+
+    public boolean isChainingOfOperatorsWithDifferentMaxParallelismEnabled() {
+        return jobConfiguration.get(
+                PipelineOptions.OPERATOR_CHAINING_CHAIN_OPERATORS_WITH_DIFFERENT_MAX_PARALLELISM);
     }
 
     public boolean isIterative() {
@@ -371,16 +375,6 @@ public class StreamGraph implements Pipeline {
                     vertexID, ((OutputFormatOperatorFactory) operatorFactory).getOutputFormat());
         }
         sinks.add(vertexID);
-    }
-
-    /**
-     * Register expanded sink nodes. These nodes should also be treated as sinks. But we do not add
-     * them into {@link #sinks} to avoid messing up the json plan.
-     *
-     * @param nodeIds sink nodes to register
-     */
-    public void registerExpandedSinks(Collection<Integer> nodeIds) {
-        expandedSinks.addAll(nodeIds);
     }
 
     public <IN, OUT> void addOperator(
@@ -463,12 +457,12 @@ public class StreamGraph implements Pipeline {
 
         setSerializers(
                 vertexID,
-                in1TypeInfo.createSerializer(executionConfig),
-                in2TypeInfo.createSerializer(executionConfig),
+                in1TypeInfo.createSerializer(executionConfig.getSerializerConfig()),
+                in2TypeInfo.createSerializer(executionConfig.getSerializerConfig()),
                 outSerializer);
 
         if (taskOperatorFactory.isOutputTypeConfigurable()) {
-            // sets the output type which must be know at StreamGraph creation time
+            // sets the output type which must be known at StreamGraph creation time
             taskOperatorFactory.setOutputType(outTypeInfo, executionConfig);
         }
 
@@ -499,7 +493,7 @@ public class StreamGraph implements Pipeline {
         setSerializers(vertexID, inTypeInfos, createSerializer(outTypeInfo));
 
         if (operatorFactory.isOutputTypeConfigurable()) {
-            // sets the output type which must be know at StreamGraph creation time
+            // sets the output type which must be known at StreamGraph creation time
             operatorFactory.setOutputType(outTypeInfo, executionConfig);
         }
 
@@ -513,7 +507,7 @@ public class StreamGraph implements Pipeline {
             @Nullable String slotSharingGroup,
             @Nullable String coLocationGroup,
             Class<? extends TaskInvokable> vertexClass,
-            StreamOperatorFactory<?> operatorFactory,
+            @Nullable StreamOperatorFactory<?> operatorFactory,
             String operatorName) {
 
         if (streamNodes.containsKey(vertexID)) {
@@ -700,26 +694,30 @@ public class StreamGraph implements Pipeline {
         if (partitioner == null
                 && upstreamNode.getParallelism() == downstreamNode.getParallelism()) {
             partitioner =
-                    executionConfig.isDynamicGraph()
-                            ? new ForwardForUnspecifiedPartitioner<>()
-                            : new ForwardPartitioner<>();
+                    dynamic ? new ForwardForUnspecifiedPartitioner<>() : new ForwardPartitioner<>();
         } else if (partitioner == null) {
             partitioner = new RebalancePartitioner<Object>();
         }
 
         if (partitioner instanceof ForwardPartitioner) {
             if (upstreamNode.getParallelism() != downstreamNode.getParallelism()) {
-                throw new UnsupportedOperationException(
-                        "Forward partitioning does not allow "
-                                + "change of parallelism. Upstream operation: "
-                                + upstreamNode
-                                + " parallelism: "
-                                + upstreamNode.getParallelism()
-                                + ", downstream operation: "
-                                + downstreamNode
-                                + " parallelism: "
-                                + downstreamNode.getParallelism()
-                                + " You must use another partitioning strategy, such as broadcast, rebalance, shuffle or global.");
+                if (partitioner instanceof ForwardForConsecutiveHashPartitioner) {
+                    partitioner =
+                            ((ForwardForConsecutiveHashPartitioner<?>) partitioner)
+                                    .getHashPartitioner();
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Forward partitioning does not allow "
+                                    + "change of parallelism. Upstream operation: "
+                                    + upstreamNode
+                                    + " parallelism: "
+                                    + upstreamNode.getParallelism()
+                                    + ", downstream operation: "
+                                    + downstreamNode
+                                    + " parallelism: "
+                                    + downstreamNode.getParallelism()
+                                    + " You must use another partitioning strategy, such as broadcast, rebalance, shuffle or global.");
+                }
             }
         }
 
@@ -754,6 +752,20 @@ public class StreamGraph implements Pipeline {
         if (getStreamNode(vertexID) != null) {
             getStreamNode(vertexID).setParallelism(parallelism);
         }
+    }
+
+    public boolean isDynamic() {
+        return dynamic;
+    }
+
+    public void setParallelism(Integer vertexId, int parallelism, boolean parallelismConfigured) {
+        if (getStreamNode(vertexId) != null) {
+            getStreamNode(vertexId).setParallelism(parallelism, parallelismConfigured);
+        }
+    }
+
+    public void setDynamic(boolean dynamic) {
+        this.dynamic = dynamic;
     }
 
     public void setMaxParallelism(int vertexID, int maxParallelism) {
@@ -825,7 +837,10 @@ public class StreamGraph implements Pipeline {
 
         vertex.setSerializersIn(
                 inTypeInfos.stream()
-                        .map(typeInfo -> typeInfo.createSerializer(executionConfig))
+                        .map(
+                                typeInfo ->
+                                        typeInfo.createSerializer(
+                                                executionConfig.getSerializerConfig()))
                         .toArray(TypeSerializer[]::new));
         vertex.setSerializerOut(out);
     }
@@ -895,20 +910,8 @@ public class StreamGraph implements Pipeline {
         return sinks;
     }
 
-    public Collection<Integer> getExpandedSinkIds() {
-        return expandedSinks;
-    }
-
     public Collection<StreamNode> getStreamNodes() {
         return streamNodes.values();
-    }
-
-    public Set<Tuple2<Integer, StreamOperatorFactory<?>>> getAllOperatorFactory() {
-        Set<Tuple2<Integer, StreamOperatorFactory<?>>> operatorSet = new HashSet<>();
-        for (StreamNode vertex : streamNodes.values()) {
-            operatorSet.add(new Tuple2<>(vertex.getId(), vertex.getOperatorFactory()));
-        }
-        return operatorSet;
     }
 
     public String getBrokerID(Integer vertexID) {
@@ -1027,7 +1030,7 @@ public class StreamGraph implements Pipeline {
 
     private <T> TypeSerializer<T> createSerializer(TypeInformation<T> typeInfo) {
         return typeInfo != null && !(typeInfo instanceof MissingTypeInfo)
-                ? typeInfo.createSerializer(executionConfig)
+                ? typeInfo.createSerializer(executionConfig.getSerializerConfig())
                 : null;
     }
 
@@ -1037,6 +1040,14 @@ public class StreamGraph implements Pipeline {
 
     public JobType getJobType() {
         return jobType;
+    }
+
+    public boolean isAutoParallelismEnabled() {
+        return autoParallelismEnabled;
+    }
+
+    public void setAutoParallelismEnabled(boolean autoParallelismEnabled) {
+        this.autoParallelismEnabled = autoParallelismEnabled;
     }
 
     public PipelineOptions.VertexDescriptionMode getVertexDescriptionMode() {
@@ -1065,5 +1076,13 @@ public class StreamGraph implements Pipeline {
 
     public List<JobStatusHook> getJobStatusHooks() {
         return this.jobStatusHooks;
+    }
+
+    public void setSupportsConcurrentExecutionAttempts(
+            Integer vertexId, boolean supportsConcurrentExecutionAttempts) {
+        final StreamNode streamNode = getStreamNode(vertexId);
+        if (streamNode != null) {
+            streamNode.setSupportsConcurrentExecutionAttempts(supportsConcurrentExecutionAttempts);
+        }
     }
 }

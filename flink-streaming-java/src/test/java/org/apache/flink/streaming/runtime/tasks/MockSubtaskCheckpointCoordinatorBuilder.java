@@ -22,8 +22,8 @@ import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.operators.testutils.MockEnvironment;
-import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
-import org.apache.flink.runtime.state.memory.MemoryBackendCheckpointStorageAccess;
+import org.apache.flink.runtime.state.CheckpointStorage;
+import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
 import org.apache.flink.runtime.taskmanager.AsyncExceptionHandler;
 import org.apache.flink.util.concurrent.Executors;
 import org.apache.flink.util.concurrent.FutureUtils;
@@ -34,11 +34,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 
 import static org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor.IMMEDIATE;
+import static org.apache.flink.streaming.runtime.tasks.SubtaskCheckpointCoordinatorImpl.openChannelStateWriter;
 
 /** A mock builder to build {@link SubtaskCheckpointCoordinator}. */
 public class MockSubtaskCheckpointCoordinatorBuilder {
     private String taskName = "mock-task";
-    private CheckpointStorageWorkerView checkpointStorage;
+    private CheckpointStorage checkpointStorage;
     private Environment environment;
     private AsyncExceptionHandler asyncExceptionHandler;
     private StreamTaskActionExecutor actionExecutor = IMMEDIATE;
@@ -47,6 +48,7 @@ public class MockSubtaskCheckpointCoordinatorBuilder {
                     ChannelStateWriter, Long, CompletableFuture<Void>, CheckpointException>
             prepareInputSnapshot = (channelStateWriter, aLong) -> FutureUtils.completedVoidFuture();
     private boolean unalignedCheckpointEnabled;
+    private int maxSubtasksPerChannelStateFile = 5;
     private int maxRecordAbortedCheckpoints = 10;
     private boolean enableCheckpointAfterTasksFinished = true;
 
@@ -91,25 +93,35 @@ public class MockSubtaskCheckpointCoordinatorBuilder {
             this.environment = MockEnvironment.builder().build();
         }
         if (checkpointStorage == null) {
-            this.checkpointStorage =
-                    new MemoryBackendCheckpointStorageAccess(
-                            environment.getJobID(), null, null, 1024);
+            this.checkpointStorage = new JobManagerCheckpointStorage();
+            this.environment.setCheckpointStorageAccess(
+                    checkpointStorage.createCheckpointStorage(environment.getJobID()));
         }
         if (asyncExceptionHandler == null) {
             this.asyncExceptionHandler = new NonHandleAsyncException();
         }
+        ChannelStateWriter channelStateWriter =
+                unalignedCheckpointEnabled
+                        ? openChannelStateWriter(
+                                taskName,
+                                () ->
+                                        checkpointStorage.createCheckpointStorage(
+                                                environment.getJobID()),
+                                environment,
+                                maxSubtasksPerChannelStateFile)
+                        : ChannelStateWriter.NO_OP;
 
         return new SubtaskCheckpointCoordinatorImpl(
-                checkpointStorage,
+                checkpointStorage.createCheckpointStorage(environment.getJobID()),
                 taskName,
                 actionExecutor,
                 executorService,
                 environment,
                 asyncExceptionHandler,
-                unalignedCheckpointEnabled,
-                enableCheckpointAfterTasksFinished,
                 prepareInputSnapshot,
                 maxRecordAbortedCheckpoints,
+                channelStateWriter,
+                enableCheckpointAfterTasksFinished,
                 (callable, duration) -> () -> {});
     }
 

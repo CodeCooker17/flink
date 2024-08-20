@@ -26,6 +26,7 @@ import org.apache.flink.runtime.io.network.buffer.NetworkBufferPool;
 import org.apache.flink.runtime.io.network.partition.BufferAvailabilityListener;
 import org.apache.flink.runtime.io.network.partition.NoOpBufferAvailablityListener;
 import org.apache.flink.runtime.io.network.partition.ResultSubpartition.BufferAndBacklog;
+import org.apache.flink.runtime.io.network.partition.ResultSubpartitionView;
 import org.apache.flink.runtime.io.network.partition.ResultSubpartitionView.AvailabilityWithBacklog;
 
 import org.junit.jupiter.api.Test;
@@ -42,11 +43,11 @@ import static org.apache.flink.runtime.io.network.partition.hybrid.HybridShuffle
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Tests for {@link HsSubpartitionView}. */
+/** Tests for {@link HsSubpartitionConsumer}. */
 class HsSubpartitionViewTest {
     @Test
     void testGetNextBufferFromDisk() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         BufferAndBacklog bufferAndBacklog = createBufferAndBacklog(1, DataType.DATA_BUFFER, 0);
         CompletableFuture<Void> consumeBufferFromMemoryFuture = new CompletableFuture<>();
@@ -77,7 +78,7 @@ class HsSubpartitionViewTest {
         final int bufferSize = 16;
         NetworkBufferPool networkBufferPool = new NetworkBufferPool(10, bufferSize);
         BufferPool bufferPool = networkBufferPool.createBufferPool(10, 10);
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         CompletableFuture<Void> acquireWriteLock = new CompletableFuture<>();
 
@@ -102,7 +103,8 @@ class HsSubpartitionViewTest {
                                     } catch (Exception e) {
                                         throw new RuntimeException(e);
                                     }
-                                    spillingInfoProvider.getNextBufferIndexToConsume();
+                                    spillingInfoProvider.getNextBufferIndexToConsume(
+                                            HsConsumerId.DEFAULT);
                                     return HsSpillingStrategy.Decision.NO_ACTION;
                                 })
                         .build();
@@ -112,11 +114,14 @@ class HsSubpartitionViewTest {
                         bufferSize,
                         bufferPool,
                         spillingStrategy,
-                        new HsFileDataIndexImpl(1),
+                        new HsFileDataIndexImpl(
+                                1, dataFilePath.resolve(".index"), 256, Long.MAX_VALUE),
                         dataFilePath.resolve(".data"),
-                        null);
+                        null,
+                        0);
         memoryDataManager.setOutputMetrics(createTestingOutputMetrics());
-        HsDataView hsDataView = memoryDataManager.registerSubpartitionView(0, subpartitionView);
+        HsDataView hsDataView =
+                memoryDataManager.registerNewConsumer(0, HsConsumerId.DEFAULT, subpartitionView);
         subpartitionView.setMemoryDataView(hsDataView);
         subpartitionView.setDiskDataView(TestingHsDataView.NO_OP);
 
@@ -127,7 +132,7 @@ class HsSubpartitionViewTest {
 
     @Test
     void testGetNextBufferFromDiskNextDataTypeIsNone() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
         BufferAndBacklog bufferAndBacklog = createBufferAndBacklog(0, DataType.NONE, 0);
 
         TestingHsDataView diskDataView =
@@ -157,7 +162,7 @@ class HsSubpartitionViewTest {
 
     @Test
     void testGetNextBufferFromMemory() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         BufferAndBacklog bufferAndBacklog = createBufferAndBacklog(1, DataType.DATA_BUFFER, 0);
         TestingHsDataView memoryDataView =
@@ -178,7 +183,7 @@ class HsSubpartitionViewTest {
 
     @Test
     void testGetNextBufferThrowException() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         TestingHsDataView diskDataView =
                 TestingHsDataView.builder()
@@ -199,7 +204,7 @@ class HsSubpartitionViewTest {
 
     @Test
     void testGetNextBufferZeroBacklog() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         final int diskBacklog = 0;
         final int memoryBacklog = 10;
@@ -235,8 +240,9 @@ class HsSubpartitionViewTest {
     @Test
     void testNotifyDataAvailableNeedNotify() {
         CompletableFuture<Void> notifyAvailableFuture = new CompletableFuture<>();
-        HsSubpartitionView subpartitionView =
-                createSubpartitionView(() -> notifyAvailableFuture.complete(null));
+        HsSubpartitionConsumer subpartitionView =
+                createSubpartitionView(
+                        (ResultSubpartitionView view) -> notifyAvailableFuture.complete(null));
 
         TestingHsDataView memoryDataView =
                 TestingHsDataView.builder()
@@ -255,8 +261,9 @@ class HsSubpartitionViewTest {
     @Test
     void testNotifyDataAvailableNotNeedNotify() {
         CompletableFuture<Void> notifyAvailableFuture = new CompletableFuture<>();
-        HsSubpartitionView subpartitionView =
-                createSubpartitionView(() -> notifyAvailableFuture.complete(null));
+        HsSubpartitionConsumer subpartitionView =
+                createSubpartitionView(
+                        (ResultSubpartitionView view) -> notifyAvailableFuture.complete(null));
 
         TestingHsDataView memoryDataView =
                 TestingHsDataView.builder()
@@ -276,14 +283,15 @@ class HsSubpartitionViewTest {
     @Test
     void testGetZeroBacklogNeedNotify() {
         CompletableFuture<Void> notifyAvailableFuture = new CompletableFuture<>();
-        HsSubpartitionView subpartitionView =
-                createSubpartitionView(() -> notifyAvailableFuture.complete(null));
+        HsSubpartitionConsumer subpartitionView =
+                createSubpartitionView(
+                        (ResultSubpartitionView view) -> notifyAvailableFuture.complete(null));
         subpartitionView.setMemoryDataView(TestingHsDataView.NO_OP);
         subpartitionView.setDiskDataView(
                 TestingHsDataView.builder().setGetBacklogSupplier(() -> 0).build());
 
         AvailabilityWithBacklog availabilityAndBacklog =
-                subpartitionView.getAvailabilityAndBacklog(0);
+                subpartitionView.getAvailabilityAndBacklog(false);
         assertThat(availabilityAndBacklog.getBacklog()).isZero();
 
         assertThat(notifyAvailableFuture).isNotCompleted();
@@ -293,14 +301,14 @@ class HsSubpartitionViewTest {
 
     @Test
     void testGetAvailabilityAndBacklogPositiveCredit() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
         subpartitionView.setMemoryDataView(TestingHsDataView.NO_OP);
 
         final int backlog = 2;
         subpartitionView.setDiskDataView(
                 TestingHsDataView.builder().setGetBacklogSupplier(() -> backlog).build());
         AvailabilityWithBacklog availabilityAndBacklog =
-                subpartitionView.getAvailabilityAndBacklog(1);
+                subpartitionView.getAvailabilityAndBacklog(true);
         assertThat(availabilityAndBacklog.getBacklog()).isEqualTo(backlog);
         // positive credit always available.
         assertThat(availabilityAndBacklog.isAvailable()).isTrue();
@@ -310,7 +318,7 @@ class HsSubpartitionViewTest {
     void testGetAvailabilityAndBacklogNonPositiveCreditNextIsData() {
         final int backlog = 2;
 
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
         subpartitionView.setMemoryDataView(
                 TestingHsDataView.builder()
                         .setConsumeBufferFunction(
@@ -325,7 +333,7 @@ class HsSubpartitionViewTest {
         subpartitionView.getNextBuffer();
 
         AvailabilityWithBacklog availabilityAndBacklog =
-                subpartitionView.getAvailabilityAndBacklog(0);
+                subpartitionView.getAvailabilityAndBacklog(false);
         assertThat(availabilityAndBacklog.getBacklog()).isEqualTo(backlog);
         // if credit is non-positive, only event can be available.
         assertThat(availabilityAndBacklog.isAvailable()).isFalse();
@@ -335,7 +343,7 @@ class HsSubpartitionViewTest {
     void testGetAvailabilityAndBacklogNonPositiveCreditNextIsEvent() {
         final int backlog = 2;
 
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
         subpartitionView.setMemoryDataView(
                 TestingHsDataView.builder()
                         .setConsumeBufferFunction(
@@ -350,7 +358,7 @@ class HsSubpartitionViewTest {
         subpartitionView.getNextBuffer();
 
         AvailabilityWithBacklog availabilityAndBacklog =
-                subpartitionView.getAvailabilityAndBacklog(0);
+                subpartitionView.getAvailabilityAndBacklog(false);
         assertThat(availabilityAndBacklog.getBacklog()).isEqualTo(backlog);
         // if credit is non-positive, only event can be available.
         assertThat(availabilityAndBacklog.isAvailable()).isTrue();
@@ -358,23 +366,29 @@ class HsSubpartitionViewTest {
 
     @Test
     void testRelease() throws Exception {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
-        CompletableFuture<Void> releaseDataViewFuture = new CompletableFuture<>();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
+        CompletableFuture<Void> releaseDiskViewFuture = new CompletableFuture<>();
+        CompletableFuture<Void> releaseMemoryViewFuture = new CompletableFuture<>();
         TestingHsDataView diskDataView =
                 TestingHsDataView.builder()
-                        .setReleaseDataViewRunnable(() -> releaseDataViewFuture.complete(null))
+                        .setReleaseDataViewRunnable(() -> releaseDiskViewFuture.complete(null))
+                        .build();
+        TestingHsDataView memoryDataView =
+                TestingHsDataView.builder()
+                        .setReleaseDataViewRunnable(() -> releaseMemoryViewFuture.complete(null))
                         .build();
         subpartitionView.setDiskDataView(diskDataView);
-        subpartitionView.setMemoryDataView(TestingHsDataView.NO_OP);
+        subpartitionView.setMemoryDataView(memoryDataView);
         subpartitionView.releaseAllResources();
         assertThat(subpartitionView.isReleased()).isTrue();
-        assertThat(releaseDataViewFuture).isCompleted();
+        assertThat(releaseDiskViewFuture).isCompleted();
+        assertThat(releaseMemoryViewFuture).isCompleted();
     }
 
     @Test
     void testGetConsumingOffset() {
         AtomicInteger nextBufferIndex = new AtomicInteger(0);
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
         TestingHsDataView diskDataView =
                 TestingHsDataView.builder()
                         .setConsumeBufferFunction(
@@ -397,7 +411,7 @@ class HsSubpartitionViewTest {
 
     @Test
     void testSetDataViewRepeatedly() {
-        HsSubpartitionView subpartitionView = createSubpartitionView();
+        HsSubpartitionConsumer subpartitionView = createSubpartitionView();
 
         subpartitionView.setMemoryDataView(TestingHsDataView.NO_OP);
         assertThatThrownBy(() -> subpartitionView.setMemoryDataView(TestingHsDataView.NO_OP))
@@ -410,13 +424,13 @@ class HsSubpartitionViewTest {
                 .hasMessageContaining("repeatedly set disk data view is not allowed.");
     }
 
-    private static HsSubpartitionView createSubpartitionView() {
-        return new HsSubpartitionView(new NoOpBufferAvailablityListener());
+    private static HsSubpartitionConsumer createSubpartitionView() {
+        return new HsSubpartitionConsumer(new NoOpBufferAvailablityListener());
     }
 
-    private static HsSubpartitionView createSubpartitionView(
+    private static HsSubpartitionConsumer createSubpartitionView(
             BufferAvailabilityListener bufferAvailabilityListener) {
-        return new HsSubpartitionView(bufferAvailabilityListener);
+        return new HsSubpartitionConsumer(bufferAvailabilityListener);
     }
 
     private static BufferAndBacklog createBufferAndBacklog(

@@ -19,6 +19,7 @@ package org.apache.flink.streaming.api.graph;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.io.InputFormat;
 import org.apache.flink.api.common.io.OutputFormat;
 import org.apache.flink.api.common.operators.ResourceSpec;
@@ -74,7 +75,7 @@ public class StreamNode {
     private KeySelector<?, ?>[] statePartitioners = new KeySelector[0];
     private TypeSerializer<?> stateKeySerializer;
 
-    private StreamOperatorFactory<?> operatorFactory;
+    private @Nullable StreamOperatorFactory<?> operatorFactory;
     private TypeSerializer<?>[] typeSerializersIn = new TypeSerializer[0];
     private TypeSerializer<?> typeSerializerOut;
 
@@ -93,19 +94,23 @@ public class StreamNode {
 
     private @Nullable IntermediateDataSetID consumeClusterDatasetId;
 
+    private boolean supportsConcurrentExecutionAttempts = true;
+
+    private boolean parallelismConfigured = false;
+
     @VisibleForTesting
     public StreamNode(
             Integer id,
             @Nullable String slotSharingGroup,
             @Nullable String coLocationGroup,
-            StreamOperator<?> operator,
+            @Nullable StreamOperator<?> operator,
             String operatorName,
             Class<? extends TaskInvokable> jobVertexClass) {
         this(
                 id,
                 slotSharingGroup,
                 coLocationGroup,
-                SimpleOperatorFactory.of(operator),
+                operator == null ? null : SimpleOperatorFactory.of(operator),
                 operatorName,
                 jobVertexClass);
     }
@@ -114,7 +119,7 @@ public class StreamNode {
             Integer id,
             @Nullable String slotSharingGroup,
             @Nullable String coLocationGroup,
-            StreamOperatorFactory<?> operatorFactory,
+            @Nullable StreamOperatorFactory<?> operatorFactory,
             String operatorName,
             Class<? extends TaskInvokable> jobVertexClass) {
         this.id = id;
@@ -128,8 +133,8 @@ public class StreamNode {
 
     public void addInEdge(StreamEdge inEdge) {
         checkState(
-                outEdges.stream().noneMatch(inEdge::equals),
-                "Adding not unique edge = %s to existing outEdges = %s",
+                inEdges.stream().noneMatch(inEdge::equals),
+                "Adding not unique edge = %s to existing inEdges = %s",
                 inEdge,
                 inEdges);
         if (inEdge.getTargetId() != getId()) {
@@ -189,7 +194,13 @@ public class StreamNode {
     }
 
     public void setParallelism(Integer parallelism) {
+        setParallelism(parallelism, true);
+    }
+
+    void setParallelism(Integer parallelism, boolean parallelismConfigured) {
         this.parallelism = parallelism;
+        this.parallelismConfigured =
+                parallelismConfigured && parallelism != ExecutionConfig.PARALLELISM_DEFAULT;
     }
 
     /**
@@ -248,10 +259,11 @@ public class StreamNode {
 
     @VisibleForTesting
     public StreamOperator<?> getOperator() {
+        assert operatorFactory != null && operatorFactory instanceof SimpleOperatorFactory;
         return (StreamOperator<?>) ((SimpleOperatorFactory) operatorFactory).getOperator();
     }
 
-    public StreamOperatorFactory<?> getOperatorFactory() {
+    public @Nullable StreamOperatorFactory<?> getOperatorFactory() {
         return operatorFactory;
     }
 
@@ -382,13 +394,17 @@ public class StreamNode {
 
     public Optional<OperatorCoordinator.Provider> getCoordinatorProvider(
             String operatorName, OperatorID operatorID) {
-        if (operatorFactory instanceof CoordinatedOperatorFactory) {
+        if (operatorFactory != null && operatorFactory instanceof CoordinatedOperatorFactory) {
             return Optional.of(
                     ((CoordinatedOperatorFactory) operatorFactory)
                             .getCoordinatorProvider(operatorName, operatorID));
         } else {
             return Optional.empty();
         }
+    }
+
+    boolean isParallelismConfigured() {
+        return parallelismConfigured;
     }
 
     @Override
@@ -417,5 +433,21 @@ public class StreamNode {
     public void setConsumeClusterDatasetId(
             @Nullable IntermediateDataSetID consumeClusterDatasetId) {
         this.consumeClusterDatasetId = consumeClusterDatasetId;
+    }
+
+    public boolean isSupportsConcurrentExecutionAttempts() {
+        return supportsConcurrentExecutionAttempts;
+    }
+
+    public void setSupportsConcurrentExecutionAttempts(
+            boolean supportsConcurrentExecutionAttempts) {
+        this.supportsConcurrentExecutionAttempts = supportsConcurrentExecutionAttempts;
+    }
+
+    public boolean isOutputOnlyAfterEndOfStream() {
+        if (operatorFactory == null) {
+            return false;
+        }
+        return operatorFactory.getOperatorAttributes().isOutputOnlyAfterEndOfStream();
     }
 }

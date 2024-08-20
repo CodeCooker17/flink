@@ -51,7 +51,7 @@ public interface HsSpillingStrategy {
      * @return A {@link Decision} based on the provided information, or {@link Optional#empty()} if
      *     the decision cannot be made, which indicates global information is needed.
      */
-    Optional<Decision> onBufferFinished(int numTotalUnSpillBuffers);
+    Optional<Decision> onBufferFinished(int numTotalUnSpillBuffers, int currentPoolSize);
 
     /**
      * Make a decision when a buffer is consumed.
@@ -125,36 +125,48 @@ public interface HsSpillingStrategy {
             private Builder() {}
 
             public Builder addBufferToSpill(BufferIndexAndChannel buffer) {
-                bufferToSpill.computeIfAbsent(buffer.getChannel(), ArrayList::new).add(buffer);
+                bufferToSpill
+                        .computeIfAbsent(buffer.getChannel(), k -> new ArrayList<>())
+                        .add(buffer);
                 return this;
             }
 
             public Builder addBufferToSpill(
                     int subpartitionId, List<BufferIndexAndChannel> buffers) {
-                bufferToSpill.computeIfAbsent(subpartitionId, ArrayList::new).addAll(buffers);
+                bufferToSpill
+                        .computeIfAbsent(subpartitionId, k -> new ArrayList<>())
+                        .addAll(buffers);
                 return this;
             }
 
             public Builder addBufferToSpill(
                     int subpartitionId, Deque<BufferIndexAndChannel> buffers) {
-                bufferToSpill.computeIfAbsent(subpartitionId, ArrayList::new).addAll(buffers);
+                bufferToSpill
+                        .computeIfAbsent(subpartitionId, k -> new ArrayList<>())
+                        .addAll(buffers);
                 return this;
             }
 
             public Builder addBufferToRelease(BufferIndexAndChannel buffer) {
-                bufferToRelease.computeIfAbsent(buffer.getChannel(), ArrayList::new).add(buffer);
+                bufferToRelease
+                        .computeIfAbsent(buffer.getChannel(), k -> new ArrayList<>())
+                        .add(buffer);
                 return this;
             }
 
             public Builder addBufferToRelease(
                     int subpartitionId, List<BufferIndexAndChannel> buffers) {
-                bufferToRelease.computeIfAbsent(subpartitionId, ArrayList::new).addAll(buffers);
+                bufferToRelease
+                        .computeIfAbsent(subpartitionId, k -> new ArrayList<>())
+                        .addAll(buffers);
                 return this;
             }
 
             public Builder addBufferToRelease(
                     int subpartitionId, Deque<BufferIndexAndChannel> buffers) {
-                bufferToRelease.computeIfAbsent(subpartitionId, ArrayList::new).addAll(buffers);
+                bufferToRelease
+                        .computeIfAbsent(subpartitionId, k -> new ArrayList<>())
+                        .addAll(buffers);
                 return this;
             }
 

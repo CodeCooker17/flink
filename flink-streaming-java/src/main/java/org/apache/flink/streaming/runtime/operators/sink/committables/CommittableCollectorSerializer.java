@@ -19,17 +19,21 @@
 package org.apache.flink.streaming.runtime.operators.sink.committables;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.core.io.SimpleVersionedSerialization;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.metrics.groups.SinkCommitterMetricGroup;
+import org.apache.flink.util.CollectionUtil;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -46,14 +50,17 @@ public final class CommittableCollectorSerializer<CommT>
     private final SimpleVersionedSerializer<CommT> committableSerializer;
     private final int subtaskId;
     private final int numberOfSubtasks;
+    private final SinkCommitterMetricGroup metricGroup;
 
     public CommittableCollectorSerializer(
             SimpleVersionedSerializer<CommT> committableSerializer,
             int subtaskId,
-            int numberOfSubtasks) {
+            int numberOfSubtasks,
+            SinkCommitterMetricGroup metricGroup) {
         this.committableSerializer = checkNotNull(committableSerializer);
         this.subtaskId = subtaskId;
         this.numberOfSubtasks = numberOfSubtasks;
+        this.metricGroup = metricGroup;
     }
 
     @Override
@@ -86,7 +93,8 @@ public final class CommittableCollectorSerializer<CommT>
     private CommittableCollector<CommT> deserializeV1(DataInputView in) throws IOException {
         return CommittableCollector.ofLegacy(
                 SinkV1CommittableDeserializer.readVersionAndDeserializeList(
-                        committableSerializer, in));
+                        committableSerializer, in),
+                metricGroup);
     }
 
     private void serializeV2(
@@ -109,7 +117,8 @@ public final class CommittableCollectorSerializer<CommT>
                                 Collectors.toMap(
                                         CheckpointCommittableManagerImpl::getCheckpointId, e -> e)),
                 subtaskId,
-                numberOfSubtasks);
+                numberOfSubtasks,
+                metricGroup);
     }
 
     private static void validateMagicNumber(DataInputView in) throws IOException {
@@ -122,6 +131,7 @@ public final class CommittableCollectorSerializer<CommT>
 
     private class CheckpointSimpleVersionedSerializer
             implements SimpleVersionedSerializer<CheckpointCommittableManagerImpl<CommT>> {
+
         @Override
         public int getVersion() {
             return 0;
@@ -142,22 +152,67 @@ public final class CommittableCollectorSerializer<CommT>
         @Override
         public CheckpointCommittableManagerImpl<CommT> deserialize(int version, byte[] serialized)
                 throws IOException {
+
             DataInputDeserializer in = new DataInputDeserializer(serialized);
             long checkpointId = in.readLong();
-            List<SubtaskCommittableManager<CommT>> subtasks =
+
+            List<SubtaskCommittableManager<CommT>> subtaskCommittableManagers =
                     SimpleVersionedSerialization.readVersionAndDeserializeList(
-                            new SubtaskSimpleVersionedSerializer(), in);
+                            new SubtaskSimpleVersionedSerializer(checkpointId), in);
+
+            Map<Integer, SubtaskCommittableManager<CommT>> subtasksCommittableManagers =
+                    CollectionUtil.newHashMapWithExpectedSize(subtaskCommittableManagers.size());
+
+            for (SubtaskCommittableManager<CommT> subtaskCommittableManager :
+                    subtaskCommittableManagers) {
+
+                // check if we already have manager for current
+                // subtaskCommittableManager.getSubtaskId() if yes,
+                // then merge them.
+                SubtaskCommittableManager<CommT> mergedManager =
+                        subtasksCommittableManagers.computeIfPresent(
+                                subtaskId,
+                                (key, manager) -> manager.merge(subtaskCommittableManager));
+
+                // This is new subtaskId, lets add the mapping.
+                if (mergedManager == null) {
+                    subtasksCommittableManagers.put(
+                            subtaskCommittableManager.getSubtaskId(), subtaskCommittableManager);
+                }
+            }
+
             return new CheckpointCommittableManagerImpl<>(
-                    subtasks.stream()
-                            .collect(
-                                    Collectors.toMap(
-                                            SubtaskCommittableManager::getSubtaskId, e -> e)),
-                    checkpointId);
+                    subtasksCommittableManagers,
+                    subtaskId,
+                    numberOfSubtasks,
+                    checkpointId,
+                    metricGroup);
         }
     }
 
     private class SubtaskSimpleVersionedSerializer
             implements SimpleVersionedSerializer<SubtaskCommittableManager<CommT>> {
+
+        @Nullable private final Long checkpointId;
+
+        /**
+         * This ctor must be used to create a deserializer where the checkpointId is used to set the
+         * checkpointId of the deserialized SubtaskCommittableManager.
+         *
+         * @param checkpointId used to recover the SubtaskCommittableManager
+         */
+        public SubtaskSimpleVersionedSerializer(long checkpointId) {
+            this.checkpointId = checkpointId;
+        }
+
+        /**
+         * When using this ctor, you cannot use the serializer for deserialization because it misses
+         * the checkpointId. For deserialization please use {@link
+         * #SubtaskSimpleVersionedSerializer(long)}.
+         */
+        public SubtaskSimpleVersionedSerializer() {
+            this.checkpointId = null;
+        }
 
         @Override
         public int getVersion() {
@@ -190,7 +245,10 @@ public final class CommittableCollectorSerializer<CommT>
                     in.readInt(),
                     in.readInt(),
                     subtaskId,
-                    Sink.InitContext.INITIAL_CHECKPOINT_ID);
+                    checkNotNull(
+                            checkpointId,
+                            "CheckpointId must be set to align the SubtaskCommittableManager with holding CheckpointCommittableManager."),
+                    metricGroup);
         }
 
         private class RequestSimpleVersionedSerializer
@@ -218,7 +276,10 @@ public final class CommittableCollectorSerializer<CommT>
                         SimpleVersionedSerialization.readVersionAndDeSerialize(
                                 committableSerializer, in);
                 return new CommitRequestImpl<>(
-                        committable, in.readInt(), CommitRequestState.values()[in.readInt()]);
+                        committable,
+                        in.readInt(),
+                        CommitRequestState.values()[in.readInt()],
+                        metricGroup);
             }
         }
     }

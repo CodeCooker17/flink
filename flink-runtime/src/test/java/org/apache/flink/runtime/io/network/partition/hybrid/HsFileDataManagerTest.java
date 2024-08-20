@@ -27,14 +27,12 @@ import org.apache.flink.runtime.io.network.buffer.BufferRecycler;
 import org.apache.flink.runtime.io.network.partition.BufferReaderWriterUtil;
 import org.apache.flink.runtime.io.network.partition.NoOpBufferAvailablityListener;
 import org.apache.flink.runtime.io.network.partition.ResultSubpartition;
-import org.apache.flink.util.TestLoggerExtension;
 import org.apache.flink.util.function.BiConsumerWithException;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -45,6 +43,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Random;
@@ -52,13 +51,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
+import static org.apache.flink.runtime.io.network.partition.hybrid.HsConsumerId.DEFAULT;
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link HsFileDataManager}. */
-@ExtendWith(TestLoggerExtension.class)
 class HsFileDataManagerTest {
     private static final int BUFFER_SIZE = 1024;
 
@@ -78,7 +77,7 @@ class HsFileDataManagerTest {
 
     private HsFileDataManager fileDataManager;
 
-    private TestingSubpartitionViewInternalOperation subpartitionViewOperation;
+    private TestingSubpartitionConsumerInternalOperation subpartitionViewOperation;
 
     private TestingHsSubpartitionFileReader.Factory factory;
 
@@ -95,13 +94,14 @@ class HsFileDataManagerTest {
                 new HsFileDataManager(
                         bufferPool,
                         ioExecutor,
-                        new HsFileDataIndexImpl(NUM_SUBPARTITIONS),
+                        new HsFileDataIndexImpl(
+                                NUM_SUBPARTITIONS, tempDir.resolve(".index"), 256, Long.MAX_VALUE),
                         dataFilePath,
                         factory,
                         HybridShuffleConfiguration.builder(
                                         NUM_SUBPARTITIONS, bufferPool.getNumBuffersPerRequest())
                                 .build());
-        subpartitionViewOperation = new TestingSubpartitionViewInternalOperation();
+        subpartitionViewOperation = new TestingSubpartitionConsumerInternalOperation();
     }
 
     @AfterEach
@@ -123,7 +123,7 @@ class HsFileDataManagerTest {
 
         assertThat(reader.readBuffers).isEmpty();
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
         ioExecutor.trigger();
 
@@ -142,7 +142,7 @@ class HsFileDataManagerTest {
 
         factory.allReaders.add(reader);
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
         ioExecutor.trigger();
 
@@ -174,7 +174,7 @@ class HsFileDataManagerTest {
                 });
         factory.allReaders.add(reader);
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
         ioExecutor.trigger();
 
@@ -207,8 +207,8 @@ class HsFileDataManagerTest {
         factory.allReaders.add(reader1);
         factory.allReaders.add(reader2);
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
-        fileDataManager.registerNewSubpartition(1, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(1, DEFAULT, subpartitionViewOperation);
 
         // trigger run.
         ioExecutor.trigger();
@@ -217,18 +217,15 @@ class HsFileDataManagerTest {
     }
 
     @Test
-    void testRunRequestBufferTimeout() throws Exception {
+    void testRunRequestBufferTimeout(@TempDir Path tempDir) throws Exception {
         Duration bufferRequestTimeout = Duration.ofSeconds(3);
-
-        // request all buffer first.
-        bufferPool.requestBuffers();
-        assertThat(bufferPool.getAvailableBuffers()).isZero();
 
         fileDataManager =
                 new HsFileDataManager(
                         bufferPool,
                         ioExecutor,
-                        new HsFileDataIndexImpl(NUM_SUBPARTITIONS),
+                        new HsFileDataIndexImpl(
+                                NUM_SUBPARTITIONS, tempDir.resolve(".index"), 256, Long.MAX_VALUE),
                         dataFilePath,
                         factory,
                         HybridShuffleConfiguration.builder(
@@ -241,11 +238,23 @@ class HsFileDataManagerTest {
         CompletableFuture<Throwable> cause = new CompletableFuture<>();
         reader.setPrepareForSchedulingRunnable(() -> prepareForSchedulingFinished.complete(null));
         reader.setFailConsumer((cause::complete));
+        reader.setReadBuffersConsumer(
+                (requestedBuffers, ignore) -> {
+                    assertThat(requestedBuffers).hasSize(bufferPool.getNumTotalBuffers());
+                    // discard all buffers so that they cannot be recycled.
+                    requestedBuffers.clear();
+                });
         factory.allReaders.add(reader);
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        // register a new consumer, this will trigger io scheduler run a round.
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
+        // first round run will allocate and use all buffers.
         ioExecutor.trigger();
+        assertThat(bufferPool.getAvailableBuffers()).isZero();
+
+        // second round run will trigger timeout.
+        fileDataManager.run();
 
         assertThat(prepareForSchedulingFinished).isCompleted();
         assertThat(cause).isCompleted();
@@ -269,7 +278,7 @@ class HsFileDataManagerTest {
                 });
         factory.allReaders.add(reader);
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
         ioExecutor.trigger();
 
@@ -314,7 +323,7 @@ class HsFileDataManagerTest {
                 };
         releaseThread.start();
 
-        fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+        fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionViewOperation);
 
         ioExecutor.trigger();
 
@@ -335,7 +344,8 @@ class HsFileDataManagerTest {
         fileDataManager.release();
         assertThatThrownBy(
                         () -> {
-                            fileDataManager.registerNewSubpartition(0, subpartitionViewOperation);
+                            fileDataManager.registerNewConsumer(
+                                    0, DEFAULT, subpartitionViewOperation);
                             ioExecutor.trigger();
                         })
                 .isInstanceOf(IllegalStateException.class)
@@ -349,18 +359,20 @@ class HsFileDataManagerTest {
      * release subpartition reader and subpartition reader fail should not be inside lock.
      */
     @Test
-    void testConsumeWhileReleaseNoDeadlock() throws Exception {
+    void testConsumeWhileReleaseNoDeadlock(@TempDir Path tempDir) throws Exception {
         CompletableFuture<Void> consumerStart = new CompletableFuture<>();
         CompletableFuture<Void> readerFail = new CompletableFuture<>();
-        HsSubpartitionView subpartitionView =
-                new HsSubpartitionView(new NoOpBufferAvailablityListener());
+        HsSubpartitionConsumer subpartitionView =
+                new HsSubpartitionConsumer(new NoOpBufferAvailablityListener());
 
         HsSubpartitionFileReaderImpl subpartitionFileReader =
                 new HsSubpartitionFileReaderImpl(
                         0,
+                        DEFAULT,
                         dataFileChannel,
                         subpartitionView,
-                        new HsFileDataIndexImpl(NUM_SUBPARTITIONS),
+                        new HsFileDataIndexImpl(
+                                NUM_SUBPARTITIONS, tempDir.resolve(".index"), 256, Long.MAX_VALUE),
                         5,
                         fileDataManager::releaseSubpartitionReader,
                         BufferReaderWriterUtil.allocatedHeaderBuffer()) {
@@ -376,7 +388,7 @@ class HsFileDataManagerTest {
                     }
                 };
         factory.allReaders.add(subpartitionFileReader);
-        HsDataView diskDataView = fileDataManager.registerNewSubpartition(0, subpartitionView);
+        HsDataView diskDataView = fileDataManager.registerNewConsumer(0, DEFAULT, subpartitionView);
         subpartitionView.setDiskDataView(diskDataView);
         TestingHsDataView memoryDataView =
                 TestingHsDataView.builder()
@@ -470,12 +482,13 @@ class HsFileDataManagerTest {
 
         @Override
         public Optional<ResultSubpartition.BufferAndBacklog> consumeBuffer(
-                int nextBufferToConsume) {
+                int nextBufferToConsume, Collection<Buffer> buffersToRecycle) {
             return Optional.empty();
         }
 
         @Override
-        public Buffer.DataType peekNextToConsumeDataType(int nextBufferToConsume) {
+        public Buffer.DataType peekNextToConsumeDataType(
+                int nextBufferToConsume, Collection<Buffer> buffersToRecycle) {
             return Buffer.DataType.NONE;
         }
 
@@ -496,8 +509,9 @@ class HsFileDataManagerTest {
             @Override
             public HsSubpartitionFileReader createFileReader(
                     int subpartitionId,
+                    HsConsumerId consumerId,
                     FileChannel dataFileChannel,
-                    HsSubpartitionViewInternalOperations operation,
+                    HsSubpartitionConsumerInternalOperations operation,
                     HsFileDataIndex dataIndex,
                     int maxBuffersReadAhead,
                     Consumer<HsSubpartitionFileReader> fileReaderReleaser,

@@ -24,28 +24,28 @@ import org.apache.flink.api.common.eventtime.WatermarkGenerator;
 import org.apache.flink.api.common.eventtime.WatermarkOutput;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.watermarkstatus.WatermarkStatus;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.Serializable;
+import java.time.Duration;
 
 import static org.apache.flink.streaming.util.StreamRecordMatchers.streamRecord;
 import static org.apache.flink.streaming.util.WatermarkMatchers.legacyWatermark;
-import static org.hamcrest.Matchers.empty;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.HamcrestCondition.matching;
 
 /** Tests for {@link TimestampsAndWatermarksOperator}. */
-public class TimestampsAndWatermarksOperatorTest {
+class TimestampsAndWatermarksOperatorTest {
 
     private static final long AUTO_WATERMARK_INTERVAL = 50L;
 
     @Test
-    public void inputWatermarksAreNotForwarded() throws Exception {
+    void inputWatermarksAreNotForwarded() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -54,11 +54,11 @@ public class TimestampsAndWatermarksOperatorTest {
         testHarness.processWatermark(createLegacyWatermark(42L));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(testHarness.getOutput(), empty());
+        assertThat(testHarness.getOutput()).isEmpty();
     }
 
     @Test
-    public void inputStatusesAreNotForwarded() throws Exception {
+    void inputStatusesAreNotForwarded() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -67,11 +67,11 @@ public class TimestampsAndWatermarksOperatorTest {
         testHarness.processWatermarkStatus(WatermarkStatus.IDLE);
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(testHarness.getOutput(), empty());
+        assertThat(testHarness.getOutput()).isEmpty();
     }
 
     @Test
-    public void longMaxInputWatermarkIsForwarded() throws Exception {
+    void longMaxInputWatermarkIsForwarded() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -79,11 +79,12 @@ public class TimestampsAndWatermarksOperatorTest {
 
         testHarness.processWatermark(createLegacyWatermark(Long.MAX_VALUE));
 
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(Long.MAX_VALUE)));
+        assertThat(pollNextLegacyWatermark(testHarness))
+                .is(matching(legacyWatermark(Long.MAX_VALUE)));
     }
 
     @Test
-    public void periodicWatermarksEmitOnPeriodicEmitStreamMode() throws Exception {
+    void periodicWatermarksEmitOnPeriodicEmitStreamMode() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -92,18 +93,18 @@ public class TimestampsAndWatermarksOperatorTest {
         testHarness.processElement(new StreamRecord<>(2L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(2L, 2L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(1L)));
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(2L, 2L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(1L)));
 
         testHarness.processElement(new StreamRecord<>(4L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL * 2);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(4L, 4L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(3L)));
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(4L, 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(3L)));
     }
 
     @Test
-    public void periodicWatermarksBatchMode() throws Exception {
+    void periodicWatermarksBatchMode() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createBatchHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -112,18 +113,18 @@ public class TimestampsAndWatermarksOperatorTest {
         testHarness.processElement(new StreamRecord<>(2L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(2L, 2L));
-        assertNull(pollNextLegacyWatermark(testHarness));
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(2L, 2L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).isNull();
 
         testHarness.processElement(new StreamRecord<>(4L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL * 2);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(4L, 4L));
-        assertNull(pollNextLegacyWatermark(testHarness));
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(4L, 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).isNull();
     }
 
     @Test
-    public void periodicWatermarksOnlyEmitOnPeriodicEmitStreamMode() throws Exception {
+    void periodicWatermarksOnlyEmitOnPeriodicEmitStreamMode() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -131,12 +132,12 @@ public class TimestampsAndWatermarksOperatorTest {
 
         testHarness.processElement(new StreamRecord<>(2L, 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(2L, 2L));
-        assertThat(testHarness.getOutput(), empty());
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(2L, 2L)));
+        assertThat(testHarness.getOutput()).isEmpty();
     }
 
     @Test
-    public void periodicWatermarksDoNotRegressStreamMode() throws Exception {
+    void periodicWatermarksDoNotRegressStreamMode() throws Exception {
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
                         WatermarkStrategy.forGenerator((ctx) -> new PeriodicWatermarkGenerator())
@@ -145,18 +146,18 @@ public class TimestampsAndWatermarksOperatorTest {
         testHarness.processElement(new StreamRecord<>(4L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(4L, 4L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(3L)));
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(4L, 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(3L)));
 
         testHarness.processElement(new StreamRecord<>(2L, 1));
         testHarness.setProcessingTime(AUTO_WATERMARK_INTERVAL);
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(2L, 2L));
-        assertThat(testHarness.getOutput(), empty());
+        assertThat(pollNextStreamRecord(testHarness)).is(matching(streamRecord(2L, 2L)));
+        assertThat(testHarness.getOutput()).isEmpty();
     }
 
     @Test
-    public void punctuatedWatermarksEmitImmediatelyStreamMode() throws Exception {
+    void punctuatedWatermarksEmitImmediatelyStreamMode() throws Exception {
         OneInputStreamOperatorTestHarness<Tuple2<Boolean, Long>, Tuple2<Boolean, Long>>
                 testHarness =
                         createTestHarness(
@@ -166,17 +167,19 @@ public class TimestampsAndWatermarksOperatorTest {
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 2L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 2L), 2L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(2L)));
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 2L), 2L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(2L)));
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 4L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 4L), 4L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(4L)));
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 4L), 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(4L)));
     }
 
     @Test
-    public void punctuatedWatermarksBatchMode() throws Exception {
+    void punctuatedWatermarksBatchMode() throws Exception {
         OneInputStreamOperatorTestHarness<Tuple2<Boolean, Long>, Tuple2<Boolean, Long>>
                 testHarness =
                         createBatchHarness(
@@ -186,17 +189,19 @@ public class TimestampsAndWatermarksOperatorTest {
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 2L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 2L), 2L));
-        assertNull(pollNextLegacyWatermark(testHarness));
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 2L), 2L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).isNull();
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 4L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 4L), 4L));
-        assertNull(pollNextLegacyWatermark(testHarness));
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 4L), 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).isNull();
     }
 
     @Test
-    public void punctuatedWatermarksDoNotRegressStreamMode() throws Exception {
+    void punctuatedWatermarksDoNotRegressStreamMode() throws Exception {
         OneInputStreamOperatorTestHarness<Tuple2<Boolean, Long>, Tuple2<Boolean, Long>>
                 testHarness =
                         createTestHarness(
@@ -206,18 +211,20 @@ public class TimestampsAndWatermarksOperatorTest {
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 4L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 4L), 4L));
-        assertThat(pollNextLegacyWatermark(testHarness), is(legacyWatermark(4L)));
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 4L), 4L)));
+        assertThat(pollNextLegacyWatermark(testHarness)).is(matching(legacyWatermark(4L)));
 
         testHarness.processElement(new StreamRecord<>(new Tuple2<>(true, 2L), 1));
 
-        assertThat(pollNextStreamRecord(testHarness), streamRecord(new Tuple2<>(true, 2L), 2L));
-        assertThat(testHarness.getOutput(), empty());
+        assertThat(pollNextStreamRecord(testHarness))
+                .is(matching(streamRecord(new Tuple2<>(true, 2L), 2L)));
+        assertThat(testHarness.getOutput()).isEmpty();
     }
 
     /** Negative timestamps also must be correctly forwarded. */
     @Test
-    public void testNegativeTimestamps() throws Exception {
+    void testNegativeTimestamps() throws Exception {
 
         OneInputStreamOperatorTestHarness<Long, Long> testHarness =
                 createTestHarness(
@@ -231,8 +238,48 @@ public class TimestampsAndWatermarksOperatorTest {
         }
 
         for (long value : values) {
-            assertThat(pollNextStreamRecord(testHarness).getTimestamp(), is(value));
+            assertThat(pollNextStreamRecord(testHarness).getTimestamp()).isEqualTo(value);
         }
+    }
+
+    @Test
+    void watermarksWithIdlenessUnderBackpressure() throws Exception {
+        long idleTimeout = 100;
+
+        TimestampsAndWatermarksOperator<Tuple2<Boolean, Long>> operator =
+                new TimestampsAndWatermarksOperator<>(
+                        WatermarkStrategy.forGenerator((ctx) -> new PunctuatedWatermarkGenerator())
+                                .withTimestampAssigner((ctx) -> new TupleExtractor())
+                                .withIdleness(Duration.ofMillis(idleTimeout)),
+                        true);
+
+        OneInputStreamOperatorTestHarness<Tuple2<Boolean, Long>, Tuple2<Boolean, Long>>
+                testHarness = new OneInputStreamOperatorTestHarness<>(operator);
+        testHarness.open();
+
+        TaskIOMetricGroup taskIOMetricGroup =
+                testHarness.getEnvironment().getMetricGroup().getIOMetricGroup();
+        taskIOMetricGroup.getHardBackPressuredTimePerSecond().markStart();
+
+        for (int i = 0; i < 10; i++) {
+            testHarness.advanceTime(idleTimeout);
+        }
+        assertThat(testHarness.getOutput()).isEmpty();
+
+        taskIOMetricGroup.getHardBackPressuredTimePerSecond().markEnd();
+        taskIOMetricGroup.getSoftBackPressuredTimePerSecond().markStart();
+
+        for (int i = 10; i < 20; i++) {
+            testHarness.advanceTime(idleTimeout);
+        }
+        assertThat(testHarness.getOutput()).isEmpty();
+
+        taskIOMetricGroup.getSoftBackPressuredTimePerSecond().markEnd();
+
+        for (int i = 20; i < 30; i++) {
+            testHarness.advanceTime(idleTimeout);
+        }
+        assertThat(testHarness.getOutput()).containsExactly(WatermarkStatus.IDLE);
     }
 
     private static <T> OneInputStreamOperatorTestHarness<T, T> createTestHarness(

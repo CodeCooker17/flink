@@ -33,6 +33,7 @@ CREATE 语句用于向当前或指定的 [Catalog]({{< ref "docs/dev/table/catal
 目前 Flink SQL 支持下列 CREATE 语句：
 
 - CREATE TABLE
+- [CREATE OR] REPLACE TABLE
 - CREATE CATALOG
 - CREATE DATABASE
 - CREATE VIEW
@@ -156,6 +157,7 @@ CREATE TABLE [IF NOT EXISTS] [catalog_name.][db_name.]table_name
   )
   [COMMENT table_comment]
   [PARTITIONED BY (partition_column_name1, partition_column_name2, ...)]
+  [ <distribution> ]
   WITH (key1=val1, key2=val2, ...)
   [ LIKE source_table [( <like_options> )] | AS select_query ]
    
@@ -182,9 +184,15 @@ CREATE TABLE [IF NOT EXISTS] [catalog_name.][db_name.]table_name
 
 <like_options>:
 {
-   { INCLUDING | EXCLUDING } { ALL | CONSTRAINTS | PARTITIONS }
+   { INCLUDING | EXCLUDING } { ALL | CONSTRAINTS | DISTRIBUTION | PARTITIONS }
  | { INCLUDING | EXCLUDING | OVERWRITING } { GENERATED | OPTIONS | WATERMARKS } 
 }[, ...]
+
+<distribution>:
+{
+    DISTRIBUTION BY [ { HASH | RANGE } ] (bucket_column_name1, bucket_column_name2, ...) ] [INTO n BUCKETS]
+  | DISTRIBUTION INTO n BUCKETS
+}
 
 ```
 
@@ -317,7 +325,7 @@ CREATE TABLE MyTable (
   `user_id` BIGINT,
   `price` DOUBLE,
   `quantity` DOUBLE,
-  `cost` AS price * quanitity,  -- evaluate expression and supply the result to queries
+  `cost` AS price * quantity  -- evaluate expression and supply the result to queries
 ) WITH (
   'connector' = 'kafka'
   ...
@@ -404,6 +412,36 @@ Flink 假设声明了主键的列都是不包含 Null 值的，Connector 在处�
 
 根据指定的列对已经创建的表进行分区。若表使用 filesystem sink ，则将会为每个分区创建一个目录。
 
+### `DISTRIBUTED`
+
+Buckets enable load balancing in an external storage system by splitting data into disjoint subsets. These subsets group rows with potentially "infinite" keyspace into smaller and more manageable chunks that allow for efficient parallel processing.
+
+Bucketing depends heavily on the semantics of the underlying connector. However, a user can influence the bucketing behavior by specifying the number of buckets, the bucketing algorithm, and (if the algorithm allows it) the columns which are used for target bucket calculation.
+
+All bucketing components (i.e. bucket number, distribution algorithm, bucket key columns) are
+optional from a SQL syntax perspective.
+
+Given the following SQL statements:
+
+```sql
+-- Example 1
+CREATE TABLE MyTable (uid BIGINT, name STRING) DISTRIBUTED BY HASH(uid) INTO 4 BUCKETS;
+
+-- Example 2
+CREATE TABLE MyTable (uid BIGINT, name STRING) DISTRIBUTED BY (uid) INTO 4 BUCKETS;
+
+-- Example 3
+CREATE TABLE MyTable (uid BIGINT, name STRING) DISTRIBUTED BY (uid);
+
+-- Example 4
+CREATE TABLE MyTable (uid BIGINT, name STRING) DISTRIBUTED INTO 4 BUCKETS;
+```
+
+Example 1 declares a hash function on a fixed number of 4 buckets (i.e. HASH(uid) % 4 = target
+bucket). Example 2 leaves the selection of an algorithm up to the connector. Additionally,
+Example 3 leaves the number of buckets up  to the connector.
+In contrast, Example 4 only defines the number of buckets.
+
 ### `WITH` Options
 
 表属性用于创建 table source/sink ，一般用于寻找和创建底层的连接器。
@@ -463,6 +501,7 @@ CREATE TABLE Orders_with_watermark (
 * CONSTRAINTS - 主键和唯一键约束
 * GENERATED - 计算列
 * OPTIONS - 连接器信息、格式化方式等配置项
+* DISTRIBUTION - distribution definition
 * PARTITIONS - 表分区信息
 * WATERMARKS - watermark 定义
 
@@ -482,7 +521,7 @@ CREATE TABLE Orders_in_file (
     `user` BIGINT,
     product STRING,
     order_time_string STRING,
-    order_time AS to_timestamp(order_time)
+    order_time AS to_timestamp(order_time_string)
     
 )
 PARTITIONED BY (`user`) 
@@ -546,32 +585,104 @@ CREATE TABLE my_ctas_table (
 INSERT INTO my_ctas_table SELECT id, name, age FROM source_table WHERE mod(id, 10) = 0;
 ```
 
-**注意** CTAS 有如下约束：
+**注意：** CTAS 有如下约束：
 * 暂不支持创建临时表。
 * 暂不支持指定列信息。
 * 暂不支持指定 Watermark。
 * 暂不支持创建分区表。
 * 暂不支持主键约束。
 
-**注意** 目前，CTAS 创建的目标表是非原子性的，如果在向表中插入数据时发生错误，该表不会被自动删除。
+**注意：** 默认情况下，CTAS 是非原子性的，这意味着如果在向表中插入数据时发生错误，该表不会被自动删除。
+
+#### 原子性
+
+如果要启用 CTAS 的原子性，则应确保：
+* 对应的 Connector sink 已经实现了 CTAS 的原子性语义，你可能需要阅读对应 Connector 的文档看是否已经支持了原子性语义。如果开发者想要实现原子性语义，请参考文档 [SupportsStaging]({{< ref "docs/dev/table/sourcesSinks" >}}#sink-abilities)。
+* 设置配置项 [table.rtas-ctas.atomicity-enabled]({{< ref "docs/dev/table/config" >}}#table-rtas-ctas-atomicity-enabled) 为 `true`。
+
+{{< top >}}
+
+## [CREATE OR] REPLACE TABLE
+```sql
+[CREATE OR] REPLACE TABLE [catalog_name.][db_name.]table_name
+[COMMENT table_comment]
+WITH (key1=val1, key2=val2, ...)
+AS select_query
+```
+
+**注意：** RTAS 有如下语义:
+* REPLACE TABLE AS SELECT 语句：要被替换的目标表必须存在，否则会报错。
+* CREATE OR REPLACE TABLE AS SELECT 语句：要被替换的目标表如果不存在，引擎会自动创建；如果存在的话，引擎就直接替换它。
+
+表可以通过一个 [CREATE OR] REPLACE TABLE AS SELECT（RTAS）语句中的查询结果来替换（或创建）并填充数据，RTAS 是一种简单快捷的替换（或创建）表并插入数据的方法。
+
+RTAS 有两个部分：SELECT 部分可以是 Flink SQL 支持的任何 [SELECT 查询]({{< ref "docs/dev/table/sql/queries/overview" >}})， `REPLACE TABLE` 部分会先删除已经存在的目标表，然后根据从 `SELECT` 查询中获取列信息，创建新的目标表。 与 `CREATE TABLE` 和 `CTAS` 类似，RTAS 要求必须在目标表的 WITH 子句中指定必填的表属性。
+
+示例如下:
+
+```sql
+REPLACE TABLE my_rtas_table
+WITH (
+    'connector' = 'kafka',
+    ...
+)
+AS SELECT id, name, age FROM source_table WHERE mod(id, 10) = 0;
+```
+
+`REPLACE TABLE AS SELECT` 语句等价于使用以下语句先删除表，然后创建表并写入数据:
+```sql
+DROP TABLE my_rtas_table;
+
+CREATE TABLE my_rtas_table (
+    id BIGINT,
+    name STRING,
+    age INT
+) WITH (
+    'connector' = 'kafka',
+    ...
+);
+ 
+INSERT INTO my_rtas_table SELECT id, name, age FROM source_table WHERE mod(id, 10) = 0;
+```
+
+**注意：** RTAS 有如下约束：
+* 暂不支持替换临时表。
+* 暂不支持指定列信息。
+* 暂不支持指定 Watermark。
+* 暂不支持创建分区表。
+* 暂不支持主键约束。
+
+**注意：** 默认情况下，RTAS 是非原子性的，这意味着如果在向表中插入数据时发生错误，该表不会被自动删除或还原成原来的表。
+**注意：** RTAS 会先删除表，然后创建表并写入数据。但如果表是在基于内存的 Catalog 里，删除表只会将其从 Catalog 里移除，并不会移除物理表中的数据。因此，执行RTAS语句之前的数据仍然存在。
+
+### 原子性
+
+如果要启用 RTAS 的原子性，则应确保：
+* 对应的 Connector sink 已经实现了 RTAS 的原子性语义，你可能需要阅读对应 Connector 的文档看是否已经支持了原子性语义。如果开发者想要实现原子性语义，请参考文档 [SupportsStaging]({{< ref "docs/dev/table/sourcesSinks" >}}#sink-abilities)。
+* 设置配置项 [table.rtas-ctas.atomicity-enabled]({{< ref "docs/dev/table/config" >}}#table-rtas-ctas-atomicity-enabled) 为 `true`。
 
 {{< top >}}
 
 ## CREATE CATALOG
 
 ```sql
-CREATE CATALOG catalog_name
+CREATE CATALOG [IF NOT EXISTS] catalog_name
+  [COMMENT catalog_comment]
   WITH (key1=val1, key2=val2, ...)
 ```
 
-Create a catalog with the given catalog properties. If a catalog with the same name already exists, an exception is thrown.
+根据给定的属性创建 catalog。若已存在同名 catalog，会抛出异常。
+
+**IF NOT EXISTS**
+
+若 catalog 已经存在，则不会进行任何操作。
 
 **WITH OPTIONS**
 
-Catalog properties used to store extra information related to this catalog.
-The key and value of expression `key1=val1` should both be string literal.
+catalog 属性一般用于存储关于这个 catalog 的额外的信息。
+表达式 `key1=val1` 中的键和值都需要是字符串文本常量。
 
-Check out more details at [Catalogs]({{< ref "docs/dev/table/catalogs" >}}).
+详情见 [Catalogs]({{< ref "docs/dev/table/catalogs" >}})。
 
 {{< top >}}
 

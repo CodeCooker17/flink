@@ -26,11 +26,9 @@ import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
 import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
 import org.apache.flink.runtime.io.network.partition.BufferReaderWriterUtil;
 import org.apache.flink.runtime.io.network.partition.hybrid.HsFileDataIndex.SpilledBuffer;
-import org.apache.flink.util.TestLoggerExtension;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -46,13 +44,12 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
 
+import static org.apache.flink.core.testutils.FlinkAssertions.assertThatFuture;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link HsMemoryDataSpiller}. */
-@ExtendWith(TestLoggerExtension.class)
 class HsMemoryDataSpillerTest {
 
     private static final int BUFFER_SIZE = Integer.BYTES;
@@ -90,8 +87,8 @@ class HsMemoryDataSpillerTest {
                 memoryDataSpiller.spillAsync(bufferWithIdentityList);
         List<SpilledBuffer> expectedSpilledBuffers =
                 getExpectedSpilledBuffers(bufferWithIdentityList);
-        assertThat(future)
-                .succeedsWithin(60, TimeUnit.SECONDS)
+        assertThatFuture(future)
+                .eventuallySucceeds()
                 .satisfies(
                         spilledBuffers ->
                                 assertThat(spilledBuffers)
@@ -125,20 +122,6 @@ class HsMemoryDataSpillerTest {
     @Test
     void testClose() throws Exception {
         memoryDataSpiller = createMemoryDataSpiller(dataFilePath);
-        List<BufferWithIdentity> bufferWithIdentityList = new ArrayList<>();
-        bufferWithIdentityList.addAll(
-                createBufferWithIdentityList(
-                        false,
-                        0,
-                        Arrays.asList(Tuple2.of(0, 0), Tuple2.of(1, 1), Tuple2.of(2, 2))));
-        memoryDataSpiller.close();
-        assertThatThrownBy(() -> memoryDataSpiller.spillAsync(bufferWithIdentityList))
-                .isInstanceOf(RejectedExecutionException.class);
-    }
-
-    @Test
-    void testRelease() throws Exception {
-        memoryDataSpiller = createMemoryDataSpiller(dataFilePath);
         List<BufferWithIdentity> bufferWithIdentityList =
                 new ArrayList<>(
                         createBufferWithIdentityList(
@@ -147,8 +130,10 @@ class HsMemoryDataSpillerTest {
                                 Arrays.asList(Tuple2.of(0, 0), Tuple2.of(1, 1), Tuple2.of(2, 2))));
         memoryDataSpiller.spillAsync(bufferWithIdentityList);
         // blocked until spill finished.
-        memoryDataSpiller.release();
+        memoryDataSpiller.close();
         checkData(false, Arrays.asList(Tuple2.of(0, 0), Tuple2.of(1, 1), Tuple2.of(2, 2)));
+        assertThatThrownBy(() -> memoryDataSpiller.spillAsync(bufferWithIdentityList))
+                .isInstanceOf(RejectedExecutionException.class);
     }
 
     /**

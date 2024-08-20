@@ -27,6 +27,8 @@ import org.apache.flink.streaming.runtime.io.PushingAsyncDataInput;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.ExceptionInChainedOperatorException;
 
+import java.util.Collection;
+
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -62,6 +64,15 @@ public class NoOpTimestampsAndWatermarks<T> implements TimestampsAndWatermarks<T
     public void stopPeriodicWatermarkEmits() {
         // no periodic watermarks
     }
+
+    @Override
+    public void emitImmediateWatermark(long wallClockTimestamp) {
+        // do nothing
+    }
+
+    @Override
+    public void pauseOrResumeSplits(
+            Collection<String> splitsToPause, Collection<String> splitsToResume) {}
 
     // ------------------------------------------------------------------------
 

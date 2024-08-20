@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.runtime.operators.sink.committables;
 
 import org.apache.flink.api.connector.sink2.Committer;
+import org.apache.flink.metrics.groups.SinkCommitterMetricGroup;
 import org.apache.flink.streaming.api.connector.sink2.CommittableSummary;
 import org.apache.flink.streaming.api.connector.sink2.CommittableWithLineage;
 
@@ -42,22 +43,27 @@ class CheckpointCommittableManagerImpl<CommT> implements CheckpointCommittableMa
     @Nullable private final Long checkpointId;
     private final int subtaskId;
     private final int numberOfSubtasks;
+    private final SinkCommitterMetricGroup metricGroup;
 
     CheckpointCommittableManagerImpl(
-            int subtaskId, int numberOfSubtasks, @Nullable Long checkpointId) {
-        this.subtaskId = subtaskId;
-        this.numberOfSubtasks = numberOfSubtasks;
-        this.checkpointId = checkpointId;
-        this.subtasksCommittableManagers = new HashMap<>();
+            int subtaskId,
+            int numberOfSubtasks,
+            @Nullable Long checkpointId,
+            SinkCommitterMetricGroup metricGroup) {
+        this(new HashMap<>(), subtaskId, numberOfSubtasks, checkpointId, metricGroup);
     }
 
     CheckpointCommittableManagerImpl(
             Map<Integer, SubtaskCommittableManager<CommT>> subtasksCommittableManagers,
-            @Nullable Long checkpointId) {
+            int subtaskId,
+            int numberOfSubtasks,
+            @Nullable Long checkpointId,
+            SinkCommitterMetricGroup metricGroup) {
         this.subtasksCommittableManagers = checkNotNull(subtasksCommittableManagers);
-        this.subtaskId = 0;
-        this.numberOfSubtasks = 1;
+        this.subtaskId = subtaskId;
+        this.numberOfSubtasks = numberOfSubtasks;
         this.checkpointId = checkpointId;
+        this.metricGroup = metricGroup;
     }
 
     @Override
@@ -79,7 +85,8 @@ class CheckpointCommittableManagerImpl<CommT> implements CheckpointCommittableMa
                                 subtaskId,
                                 summary.getCheckpointId().isPresent()
                                         ? summary.getCheckpointId().getAsLong()
-                                        : null));
+                                        : null,
+                                metricGroup));
         if (existing != null) {
             throw new UnsupportedOperationException(
                     "Currently it is not supported to update the CommittableSummary for a checkpoint coming from the same subtask. Please check the status of FLINK-25920");
@@ -126,7 +133,9 @@ class CheckpointCommittableManagerImpl<CommT> implements CheckpointCommittableMa
         requests.forEach(CommitRequestImpl::setSelected);
         committer.commit(new ArrayList<>(requests));
         requests.forEach(CommitRequestImpl::setCommittedIfNoError);
-        return drainFinished();
+        Collection<CommittableWithLineage<CommT>> committed = drainFinished();
+        metricGroup.setCurrentPendingCommittablesGauge(() -> getPendingRequests(false).size());
+        return committed;
     }
 
     Collection<CommitRequestImpl<CommT>> getPendingRequests(boolean fullyReceived) {
@@ -158,6 +167,9 @@ class CheckpointCommittableManagerImpl<CommT> implements CheckpointCommittableMa
         return new CheckpointCommittableManagerImpl<>(
                 subtasksCommittableManagers.entrySet().stream()
                         .collect(Collectors.toMap(Map.Entry::getKey, (e) -> e.getValue().copy())),
-                checkpointId);
+                subtaskId,
+                numberOfSubtasks,
+                checkpointId,
+                metricGroup);
     }
 }

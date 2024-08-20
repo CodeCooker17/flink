@@ -30,6 +30,7 @@ import org.apache.flink.runtime.checkpoint.JobManagerTaskRestore;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.StateObjectCollection;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
+import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriteRequestExecutorFactory;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
@@ -42,10 +43,12 @@ import org.apache.flink.runtime.filecache.FileCache;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.apache.flink.runtime.io.network.NettyShuffleEnvironmentBuilder;
 import org.apache.flink.runtime.io.network.TaskEventDispatcher;
+import org.apache.flink.runtime.jobgraph.JobType;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
 import org.apache.flink.runtime.memory.MemoryManager;
+import org.apache.flink.runtime.memory.SharedResources;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.query.KvStateRegistry;
 import org.apache.flink.runtime.shuffle.ShuffleEnvironment;
@@ -78,7 +81,7 @@ import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.StreamSource;
 import org.apache.flink.util.SerializedValue;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -91,9 +94,8 @@ import java.util.Optional;
 import java.util.concurrent.Executor;
 
 import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.createExecutionAttemptId;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -103,7 +105,7 @@ import static org.mockito.Mockito.mock;
  * <p>In practice, reading from HDFS is interrupt sensitive: The HDFS code frequently deadlocks or
  * livelocks if it is interrupted.
  */
-public class InterruptSensitiveRestoreTest {
+class InterruptSensitiveRestoreTest {
 
     private static final OneShotLatch IN_RESTORE_LATCH = new OneShotLatch();
 
@@ -113,22 +115,22 @@ public class InterruptSensitiveRestoreTest {
     private static final int KEYED_RAW = 3;
 
     @Test
-    public void testRestoreWithInterruptOperatorManaged() throws Exception {
+    void testRestoreWithInterruptOperatorManaged() throws Exception {
         testRestoreWithInterrupt(OPERATOR_MANAGED);
     }
 
     @Test
-    public void testRestoreWithInterruptOperatorRaw() throws Exception {
+    void testRestoreWithInterruptOperatorRaw() throws Exception {
         testRestoreWithInterrupt(OPERATOR_RAW);
     }
 
     @Test
-    public void testRestoreWithInterruptKeyedManaged() throws Exception {
+    void testRestoreWithInterruptKeyedManaged() throws Exception {
         testRestoreWithInterrupt(KEYED_MANAGED);
     }
 
     @Test
-    public void testRestoreWithInterruptKeyedRaw() throws Exception {
+    void testRestoreWithInterruptKeyedRaw() throws Exception {
         testRestoreWithInterrupt(KEYED_RAW);
     }
 
@@ -164,12 +166,12 @@ public class InterruptSensitiveRestoreTest {
 
         task.getExecutingThread().join(30000);
 
-        if (task.getExecutionState() == ExecutionState.CANCELING) {
-            fail("Task is stuck and not canceling");
-        }
+        assertThat(task.getExecutionState())
+                .as("Task is stuck and not canceling")
+                .isNotEqualTo(ExecutionState.CANCELING);
 
-        assertEquals(ExecutionState.CANCELED, task.getExecutionState());
-        assertNull(task.getFailureCause());
+        assertThat(task.getExecutionState()).isEqualTo(ExecutionState.CANCELED);
+        assertThat(task.getFailureCause()).isNull();
     }
 
     // ------------------------------------------------------------------------
@@ -240,6 +242,7 @@ public class InterruptSensitiveRestoreTest {
         JobInformation jobInformation =
                 new JobInformation(
                         new JobID(),
+                        JobType.STREAMING,
                         "test job name",
                         new SerializedValue<>(new ExecutionConfig()),
                         new Configuration(),
@@ -272,6 +275,7 @@ public class InterruptSensitiveRestoreTest {
                 Collections.<ResultPartitionDeploymentDescriptor>emptyList(),
                 Collections.<InputGateDeploymentDescriptor>emptyList(),
                 mock(MemoryManager.class),
+                new SharedResources(),
                 mock(IOManager.class),
                 shuffleEnvironment,
                 new KvStateService(new KvStateRegistry(), null, null),
@@ -291,7 +295,8 @@ public class InterruptSensitiveRestoreTest {
                 new TestingTaskManagerRuntimeInfo(),
                 UnregisteredMetricGroups.createUnregisteredTaskMetricGroup(),
                 mock(PartitionProducerStateChecker.class),
-                mock(Executor.class));
+                mock(Executor.class),
+                new ChannelStateWriteRequestExecutorFactory(jobInformation.getJobId()));
     }
 
     // ------------------------------------------------------------------------

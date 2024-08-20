@@ -25,6 +25,7 @@ import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter.ChannelStateWriteResult;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriterImpl;
+import org.apache.flink.runtime.checkpoint.filemerging.FileMergingSnapshotManager;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
@@ -34,22 +35,26 @@ import org.apache.flink.runtime.state.CheckpointStateToolset;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
 import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
+import org.apache.flink.runtime.state.filesystem.FsMergingCheckpointStorageLocation;
 import org.apache.flink.runtime.taskmanager.AsyncExceptionHandler;
 import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.runtime.io.checkpointing.BarrierAlignmentUtil;
 import org.apache.flink.streaming.runtime.io.checkpointing.BarrierAlignmentUtil.Cancellable;
 import org.apache.flink.streaming.runtime.io.checkpointing.BarrierAlignmentUtil.DelayableTimer;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.IOUtils;
 import org.apache.flink.util.clock.Clock;
 import org.apache.flink.util.clock.SystemClock;
 import org.apache.flink.util.function.BiFunctionWithException;
+import org.apache.flink.util.function.SupplierWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
@@ -77,7 +82,6 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
 
     private static final Logger LOG =
             LoggerFactory.getLogger(SubtaskCheckpointCoordinatorImpl.class);
-    private static final int DEFAULT_MAX_RECORD_ABORTED_CHECKPOINTS = 128;
 
     private static final int CHECKPOINT_EXECUTION_DELAY_LOG_THRESHOLD_MS = 30_000;
 
@@ -95,6 +99,10 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
             prepareInputSnapshot;
     /** The IDs of the checkpoint for which we are notified aborted. */
     private final Set<Long> abortedCheckpointIds;
+
+    private final int maxRecordAbortedCheckpoints;
+
+    private long maxAbortedCheckpointId = 0;
 
     private long lastCheckpointId;
 
@@ -121,64 +129,7 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
      */
     private long alignmentCheckpointId;
 
-    SubtaskCheckpointCoordinatorImpl(
-            CheckpointStorageWorkerView checkpointStorage,
-            String taskName,
-            StreamTaskActionExecutor actionExecutor,
-            ExecutorService asyncOperationsThreadPool,
-            Environment env,
-            AsyncExceptionHandler asyncExceptionHandler,
-            boolean unalignedCheckpointEnabled,
-            boolean enableCheckpointAfterTasksFinished,
-            BiFunctionWithException<
-                            ChannelStateWriter, Long, CompletableFuture<Void>, CheckpointException>
-                    prepareInputSnapshot,
-            DelayableTimer registerTimer)
-            throws IOException {
-        this(
-                checkpointStorage,
-                taskName,
-                actionExecutor,
-                asyncOperationsThreadPool,
-                env,
-                asyncExceptionHandler,
-                unalignedCheckpointEnabled,
-                enableCheckpointAfterTasksFinished,
-                prepareInputSnapshot,
-                DEFAULT_MAX_RECORD_ABORTED_CHECKPOINTS,
-                registerTimer);
-    }
-
-    SubtaskCheckpointCoordinatorImpl(
-            CheckpointStorageWorkerView checkpointStorage,
-            String taskName,
-            StreamTaskActionExecutor actionExecutor,
-            ExecutorService asyncOperationsThreadPool,
-            Environment env,
-            AsyncExceptionHandler asyncExceptionHandler,
-            boolean unalignedCheckpointEnabled,
-            boolean enableCheckpointAfterTasksFinished,
-            BiFunctionWithException<
-                            ChannelStateWriter, Long, CompletableFuture<Void>, CheckpointException>
-                    prepareInputSnapshot,
-            int maxRecordAbortedCheckpoints,
-            DelayableTimer registerTimer)
-            throws IOException {
-        this(
-                checkpointStorage,
-                taskName,
-                actionExecutor,
-                asyncOperationsThreadPool,
-                env,
-                asyncExceptionHandler,
-                prepareInputSnapshot,
-                maxRecordAbortedCheckpoints,
-                unalignedCheckpointEnabled
-                        ? openChannelStateWriter(taskName, checkpointStorage, env)
-                        : ChannelStateWriter.NO_OP,
-                enableCheckpointAfterTasksFinished,
-                registerTimer);
-    }
+    @Nullable private final FileMergingSnapshotManager fileMergingSnapshotManager;
 
     @VisibleForTesting
     SubtaskCheckpointCoordinatorImpl(
@@ -194,8 +145,37 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
             int maxRecordAbortedCheckpoints,
             ChannelStateWriter channelStateWriter,
             boolean enableCheckpointAfterTasksFinished,
-            DelayableTimer registerTimer)
-            throws IOException {
+            DelayableTimer registerTimer) {
+        this(
+                checkpointStorage,
+                taskName,
+                actionExecutor,
+                asyncOperationsThreadPool,
+                env,
+                asyncExceptionHandler,
+                prepareInputSnapshot,
+                maxRecordAbortedCheckpoints,
+                channelStateWriter,
+                enableCheckpointAfterTasksFinished,
+                registerTimer,
+                null);
+    }
+
+    SubtaskCheckpointCoordinatorImpl(
+            CheckpointStorageWorkerView checkpointStorage,
+            String taskName,
+            StreamTaskActionExecutor actionExecutor,
+            ExecutorService asyncOperationsThreadPool,
+            Environment env,
+            AsyncExceptionHandler asyncExceptionHandler,
+            BiFunctionWithException<
+                            ChannelStateWriter, Long, CompletableFuture<Void>, CheckpointException>
+                    prepareInputSnapshot,
+            int maxRecordAbortedCheckpoints,
+            ChannelStateWriter channelStateWriter,
+            boolean enableCheckpointAfterTasksFinished,
+            DelayableTimer registerTimer,
+            FileMergingSnapshotManager fileMergingSnapshotManager) {
         this.checkpointStorage =
                 new CachingCheckpointStorageWorkerView(checkNotNull(checkpointStorage));
         this.taskName = checkNotNull(taskName);
@@ -209,20 +189,28 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
         this.prepareInputSnapshot = prepareInputSnapshot;
         this.abortedCheckpointIds =
                 createAbortedCheckpointSetWithLimitSize(maxRecordAbortedCheckpoints);
+        this.maxRecordAbortedCheckpoints = maxRecordAbortedCheckpoints;
         this.lastCheckpointId = -1L;
         this.closed = false;
         this.enableCheckpointAfterTasksFinished = enableCheckpointAfterTasksFinished;
         this.registerTimer = registerTimer;
         this.clock = SystemClock.getInstance();
+        this.fileMergingSnapshotManager = fileMergingSnapshotManager;
     }
 
-    private static ChannelStateWriter openChannelStateWriter(
-            String taskName, CheckpointStorageWorkerView checkpointStorage, Environment env) {
-        ChannelStateWriterImpl writer =
-                new ChannelStateWriterImpl(
-                        taskName, env.getTaskInfo().getIndexOfThisSubtask(), checkpointStorage);
-        writer.open();
-        return writer;
+    public static ChannelStateWriter openChannelStateWriter(
+            String taskName,
+            SupplierWithException<CheckpointStorageWorkerView, ? extends IOException>
+                    checkpointStorageWorkerView,
+            Environment env,
+            int maxSubtasksPerChannelStateFile) {
+        return new ChannelStateWriterImpl(
+                env.getJobVertexId(),
+                taskName,
+                env.getTaskInfo().getIndexOfThisSubtask(),
+                checkpointStorageWorkerView,
+                env.getChannelStateExecutorFactory(),
+                maxSubtasksPerChannelStateFile);
     }
 
     @Override
@@ -316,10 +304,20 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
             // broadcast cancel checkpoint marker to avoid downstream back-pressure due to
             // checkpoint barrier align.
             operatorChain.broadcastEvent(new CancelCheckpointMarker(metadata.getCheckpointId()));
+            channelStateWriter.abort(
+                    metadata.getCheckpointId(),
+                    new CancellationException("checkpoint aborted via notification"),
+                    true);
             LOG.info(
                     "Checkpoint {} has been notified as aborted, would not trigger any checkpoint.",
                     metadata.getCheckpointId());
             return;
+        }
+
+        if (fileMergingSnapshotManager != null) {
+            // notify file merging snapshot manager for managed dir lifecycle management
+            fileMergingSnapshotManager.notifyCheckpointStart(
+                    FileMergingSnapshotManager.SubtaskKey.of(env), metadata.getCheckpointId());
         }
 
         // if checkpoint has been previously unaligned, but was forced to be aligned (pointwise
@@ -358,7 +356,7 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
         // streaming topology
 
         Map<OperatorID, OperatorSnapshotFutures> snapshotFutures =
-                new HashMap<>(operatorChain.getNumberOfOperators());
+                CollectionUtil.newHashMapWithExpectedSize(operatorChain.getNumberOfOperators());
         try {
             if (takeSnapshotSync(
                     snapshotFutures, metadata, metrics, options, operatorChain, isRunning)) {
@@ -461,6 +459,7 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
                         if (checkpointId > lastCheckpointId) {
                             // only record checkpoints that have not triggered on task side.
                             abortedCheckpointIds.add(checkpointId);
+                            maxAbortedCheckpointId = Math.max(maxAbortedCheckpointId, checkpointId);
                         }
                     }
 
@@ -494,12 +493,34 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
                     case COMPLETE:
                         env.getTaskStateManager().notifyCheckpointComplete(checkpointId);
                 }
+                notifyFileMergingSnapshotManagerCheckpoint(checkpointId, notifyCheckpointOperation);
             } catch (Exception e) {
                 previousException = ExceptionUtils.firstOrSuppressed(e, previousException);
             }
         }
 
         ExceptionUtils.tryRethrowException(previousException);
+    }
+
+    private void notifyFileMergingSnapshotManagerCheckpoint(
+            long checkpointId, Task.NotifyCheckpointOperation notifyCheckpointOperation)
+            throws Exception {
+        if (fileMergingSnapshotManager != null) {
+            switch (notifyCheckpointOperation) {
+                case ABORT:
+                    fileMergingSnapshotManager.notifyCheckpointAborted(
+                            FileMergingSnapshotManager.SubtaskKey.of(env), checkpointId);
+                    break;
+                case COMPLETE:
+                    fileMergingSnapshotManager.notifyCheckpointComplete(
+                            FileMergingSnapshotManager.SubtaskKey.of(env), checkpointId);
+                    break;
+                case SUBSUME:
+                    fileMergingSnapshotManager.notifyCheckpointSubsumed(
+                            FileMergingSnapshotManager.SubtaskKey.of(env), checkpointId);
+                    break;
+            }
+        }
     }
 
     @Override
@@ -573,7 +594,8 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
     }
 
     private boolean checkAndClearAbortedStatus(long checkpointId) {
-        return abortedCheckpointIds.remove(checkpointId);
+        return abortedCheckpointIds.remove(checkpointId)
+                || checkpointId + maxRecordAbortedCheckpoints < maxAbortedCheckpointId;
     }
 
     private void registerAsyncCheckpointRunnable(
@@ -614,7 +636,9 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
         synchronized (lock) {
             asyncCheckpointRunnable = checkpoints.remove(checkpointId);
         }
-        closeQuietly(asyncCheckpointRunnable);
+        if (asyncCheckpointRunnable != null) {
+            asyncOperationsThreadPool.execute(() -> closeQuietly(asyncCheckpointRunnable));
+        }
         return asyncCheckpointRunnable != null;
     }
 
@@ -721,6 +745,7 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
         CheckpointStreamFactory storage =
                 checkpointStorage.resolveCheckpointStorageLocation(
                         checkpointId, checkpointOptions.getTargetLocation());
+        storage = applyFileMergingCheckpoint(storage, checkpointOptions);
 
         try {
             operatorChain.snapshotState(
@@ -744,8 +769,18 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
                 checkpointOptions.isUnalignedCheckpoint());
 
         checkpointMetrics.setSyncDurationMillis((System.nanoTime() - started) / 1_000_000);
-        checkpointMetrics.setUnalignedCheckpoint(checkpointOptions.isUnalignedCheckpoint());
         return true;
+    }
+
+    private CheckpointStreamFactory applyFileMergingCheckpoint(
+            CheckpointStreamFactory storage, CheckpointOptions checkpointOptions) {
+        if (storage instanceof FsMergingCheckpointStorageLocation
+                && checkpointOptions.getCheckpointType().isSavepoint()) {
+            // fall back to non-fileMerging if it is a savepoint
+            return ((FsMergingCheckpointStorageLocation) storage).toNonFileMerging();
+        } else {
+            return storage;
+        }
     }
 
     private Set<Long> createAbortedCheckpointSetWithLimitSize(int maxRecordAbortedCheckpoints) {
@@ -808,7 +843,8 @@ class SubtaskCheckpointCoordinatorImpl implements SubtaskCheckpointCoordinator {
         long delay = System.currentTimeMillis() - checkpointMetaData.getReceiveTimestamp();
         if (delay >= CHECKPOINT_EXECUTION_DELAY_LOG_THRESHOLD_MS) {
             LOG.warn(
-                    "Time from receiving all checkpoint barriers/RPC to executing it exceeded threshold: {}ms",
+                    "Time from receiving all checkpoint barriers/RPC for checkpoint {} to executing it exceeded threshold: {}ms",
+                    checkpointMetaData.getCheckpointId(),
                     delay);
         }
     }

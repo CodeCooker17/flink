@@ -23,6 +23,8 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.lineage.LineageVertexProvider;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
@@ -40,7 +42,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * @param <T> The type of the elements that this source produces
  */
 @Internal
-public class LegacySourceTransformation<T> extends PhysicalTransformation<T>
+public class LegacySourceTransformation<T> extends TransformationWithLineage<T>
         implements WithBoundedness {
 
     private final StreamOperatorFactory<T> operatorFactory;
@@ -56,25 +58,20 @@ public class LegacySourceTransformation<T> extends PhysicalTransformation<T>
      * @param outputType The type of the elements produced by this {@code
      *     LegacySourceTransformation}
      * @param parallelism The parallelism of this {@code LegacySourceTransformation}
+     * @param parallelismConfigured If true, the parallelism of the transformation is explicitly set
+     *     and should be respected. Otherwise the parallelism can be changed at runtime.
      */
     public LegacySourceTransformation(
             String name,
             StreamSource<T, ?> operator,
             TypeInformation<T> outputType,
             int parallelism,
-            Boundedness boundedness) {
-        this(name, SimpleOperatorFactory.of(operator), outputType, parallelism, boundedness);
-    }
-
-    public LegacySourceTransformation(
-            String name,
-            StreamOperatorFactory<T> operatorFactory,
-            TypeInformation<T> outputType,
-            int parallelism,
-            Boundedness boundedness) {
-        super(name, outputType, parallelism);
-        this.operatorFactory = checkNotNull(operatorFactory);
+            Boundedness boundedness,
+            boolean parallelismConfigured) {
+        super(name, outputType, parallelism, parallelismConfigured);
+        this.operatorFactory = checkNotNull(SimpleOperatorFactory.of(operator));
         this.boundedness = checkNotNull(boundedness);
+        this.extractLineageVertex(operator);
     }
 
     /** Mutable for legacy sources in the Table API. */
@@ -98,7 +95,7 @@ public class LegacySourceTransformation<T> extends PhysicalTransformation<T>
     }
 
     @Override
-    public List<Transformation<?>> getTransitivePredecessors() {
+    protected List<Transformation<?>> getTransitivePredecessorsInternal() {
         return Collections.singletonList(this);
     }
 
@@ -110,5 +107,12 @@ public class LegacySourceTransformation<T> extends PhysicalTransformation<T>
     @Override
     public final void setChainingStrategy(ChainingStrategy strategy) {
         operatorFactory.setChainingStrategy(strategy);
+    }
+
+    private void extractLineageVertex(StreamSource<T, ?> operator) {
+        SourceFunction sourceFunction = operator.getUserFunction();
+        if (sourceFunction instanceof LineageVertexProvider) {
+            setLineageVertex(((LineageVertexProvider) sourceFunction).getLineageVertex());
+        }
     }
 }
